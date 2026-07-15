@@ -34,6 +34,7 @@ public struct Ready: OptionSet, Sendable, Hashable, CustomStringConvertible {
 
     /// Convenience: read-side EOF (`hangup` without `readable`, or
     /// `readHangup`). Mirrors mio's `is_read_closed`.
+    @inlinable
     public var isReadClosed: Bool {
         // EPOLLHUP alone (no EPOLLIN) ⇒ peer closed.
         // EPOLLRDHUP ⇒ peer closed the write side.
@@ -44,6 +45,7 @@ public struct Ready: OptionSet, Sendable, Hashable, CustomStringConvertible {
 
     /// Convenience: write-side EOF (`hangup` without `writable`, or
     /// `error`). Mirrors mio's `is_write_closed`.
+    @inlinable
     public var isWriteClosed: Bool {
         let r = self.rawValue
         return (r & Ready.hangup.rawValue != 0 && r & Ready.writable.rawValue == 0)

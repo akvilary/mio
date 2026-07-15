@@ -62,7 +62,11 @@ public final class Events: @unchecked Sendable {
 
     // Raw kernel-write buffer. Allocated once, lives for the lifetime of
     // the container. 12 bytes per slot.
-    private let buffer: UnsafeMutablePointer<sl_epoll_event>
+    //
+    // `@usableFromInline` so the `@inlinable` `forEach`/`subscript` below
+    // (consumed across the module boundary by hot loops in e.g. an event
+    // loop) can read it directly without a per-element accessor call.
+    @usableFromInline internal let buffer: UnsafeMutablePointer<sl_epoll_event>
     public let capacity: Int
 
     // Number of valid records currently in `buffer`. Set by `Poll.poll`.
@@ -96,12 +100,18 @@ public final class Events: @unchecked Sendable {
     public func clear() { _count = 0 }
 
     /// Access the i-th event. Caller is responsible for `i < count`.
+    @inlinable
     public subscript(position: Int) -> Event {
         let raw = buffer[position]
         return Event(token: Token(raw.data), ready: Ready(rawValue: raw.events))
     }
 
     /// Iterate delivered events. Equivalent to mio's `Events::iter`.
+    ///
+    /// `@inlinable` so the per-event dispatch closure supplied by an event
+    /// loop is inlined into the loop body, avoiding an indirect call per
+    /// event across the module boundary.
+    @inlinable
     public func forEach(_ body: (Event) -> Void) {
         for i in 0..<_count {
             let raw = buffer[i]
