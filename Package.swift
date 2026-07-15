@@ -15,6 +15,13 @@ let package = Package(
     name: "mio",
     products: [
         .library(name: "MIO", targets: ["MIO"]),
+        // CMIO is also exposed as its own product so non-mio consumers
+        // that just need the epoll/eventfd syscall wrappers (e.g. an
+        // io_uring backend needing eventfd) can depend on it directly
+        // without pulling in the Swift primitives — and without each
+        // consumer redefining the same C symbols (which would clash at
+        // link time).
+        .library(name: "CMIO", targets: ["CMIO"]),
     ],
     targets: [
         // ── C wrappers for the epoll/eventfd syscalls Swift's Glibc
