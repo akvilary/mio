@@ -14,9 +14,9 @@ the documentation) transfers directly.
 ## Status
 
 Early / experimental. The API is small and the test suite covers the core
-contract (Poll lifecycle, register/reregister/deregister, oneshot, Waker
-cross-thread wakeup, timeouts). Used in production by
-[`starlight`](https://github.com/akvilary/starlight).
+contract (Poll lifecycle, register/reregister/deregister, oneshot,
+edge-triggered, EPOLLEXCLUSIVE, Waker cross-thread wakeup, timeouts). Used
+by [`starlight`](https://github.com/akvilary/starlight) (also experimental).
 
 ## Platform
 
@@ -77,6 +77,37 @@ let waker = try Waker(registry: registry, token: Token(0))
 waker.wake()
 // The next poll.poll() returns with a readable event on Token(0).
 ```
+
+### Nanosecond-resolution timeout (Linux 5.11+)
+
+```swift
+// epoll_pwait2 with sub-millisecond timeout; falls back to ms truncation
+// on kernels older than 5.11.
+_ = try poll.pollNano(events, timeout: .nanoseconds(0, 500_000))  // 500 µs
+```
+
+### Thundering-herd prevention via EPOLLEXCLUSIVE
+
+```swift
+// For shared-listener multi-process servers without SO_REUSEPORT.
+// Kernel delivers each accept-ready event to at most one waiter.
+try registry.register(
+    fd: listenerFD,
+    token: Token(1),
+    interest: [.readable, .exclusive]
+)
+```
+
+### Swift 6.2 concurrency model
+
+`Poll`, `Registry`, and `Waker` are `Sendable` **structurally** — their
+stored state is immutable and they perform no shared mutable Swift-level
+operations (kernel-side epoll is internally synchronised). The compiler
+verifies this without `@unchecked`.
+
+`Events` is **intentionally non-`Sendable`**: its `_count` field is mutated
+by `Poll.poll` on the calling thread, and sharing it across threads would
+race by design. Use one `Events` per worker thread.
 
 ## Why?
 

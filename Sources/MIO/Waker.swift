@@ -27,13 +27,20 @@ import Glibc
 /// counter via `reset()` (or simply by reading 8 bytes) before waiting
 /// again — otherwise level-triggered epoll will keep firing the event.
 ///
-/// `Waker` is `Sendable` and safe to share across threads. Multiple
-/// wakers may share the same token (wakeup coalescing is the kernel's
-/// responsibility: eventfd's counter saturates at `UINT64_MAX - 1` and
-/// a write into a full counter fails with `EAGAIN`).
-public final class Waker: @unchecked Sendable {
+/// `Waker` is `Sendable` (structurally — all stored properties are
+/// immutable `let`s of `Sendable` types) and safe to share across
+/// threads. Multiple wakers may share the same token (wakeup coalescing
+/// is the kernel's responsibility: eventfd's counter saturates at
+/// `UINT64_MAX - 1` and a write into a full counter fails with
+/// `EAGAIN`).
+public final class Waker: Sendable {
 
-    /// The raw eventfd. Exposed for tests.
+    /// The raw eventfd. Read-only diagnostic accessor.
+    ///
+    /// `Waker` owns the fd and closes it in `deinit`. Callers MUST NOT
+    /// `close(2)` it manually — doing so causes a double-close (silent
+    /// at best, an fd-recycling misattribution at worst: the kernel may
+    /// have already handed this number to an unrelated `socket()`).
     public let fd: CInt
 
     /// The token this waker raises when fired.
@@ -49,8 +56,10 @@ public final class Waker: @unchecked Sendable {
         // EFD_NONBLOCK | EFD_CLOEXEC. EFD_SEMAPHORE is NOT used — we want
         // 64-bit counter semantics so N wakeups don't require N reads.
         let fd = sl_eventfd(0, PollConstants.EFD_NONBLOCK | PollConstants.EFD_CLOEXEC)
+        // sl_eventfd returns either a non-negative fd on success or
+        // `-errno` on failure — race-free errno capture at the C layer.
         guard fd >= 0 else {
-            throw PollError.fromErrno(function: "eventfd")
+            throw PollError.fromNegativeReturn(fd, function: "eventfd")
         }
         self.fd = fd
         self.token = token
@@ -64,9 +73,9 @@ public final class Waker: @unchecked Sendable {
     }
 
     deinit {
-        // Best-effort deregister; ignored if the caller already removed
-        // the fd. Then close the eventfd.
-        try? registry.deregister(fd: fd)
+        // Best-effort deregister — `ENOENT` (fd already removed by the
+        // caller) is silently ignored. Then close the eventfd.
+        _ = try? registry.tryDeregister(fd: fd)
         _ = Glibc.close(fd)
     }
 
@@ -77,13 +86,25 @@ public final class Waker: @unchecked Sendable {
     /// with `EAGAIN`, which is treated as success — the waker has
     /// already been fired and not yet drained, which is exactly what
     /// the caller wanted.
+    ///
+    /// `EINTR` (signal interrupted the syscall before any bytes were
+    /// written) is retried automatically, matching mio's behaviour.
     @discardableResult
     public func wake() -> Bool {
         var val: UInt64 = 1
-        let n = withUnsafePointer(to: &val) { ptr -> Int in
-            Glibc.write(fd, ptr, 8)
+        // Retry loop: EINTR on eventfd leaves the counter untouched, so
+        // we must retry to actually deliver the wakeup. EAGAIN (counter
+        // full) returns false — but the previous wake still hasn't been
+        // drained, so functionally equivalent to success.
+        while true {
+            let n = withUnsafePointer(to: &val) { ptr -> Int in
+                Glibc.write(fd, ptr, 8)
+            }
+            if n == 8 { return true }
+            if errno == EINTR { continue }
+            // EAGAIN, EBADF (closed), EINVAL — treat as not-delivered.
+            return false
         }
-        return n == 8
     }
 
     /// Drain pending wakeups. Should be called by the loop thread after
@@ -91,14 +112,22 @@ public final class Waker: @unchecked Sendable {
     /// entire accumulated counter and resets it to zero.
     ///
     /// On a spurious wake (counter already 0) read returns `EAGAIN`,
-    /// which is silently swallowed.
+    /// which is silently swallowed (return value 0).
+    ///
+    /// `EINTR` is retried automatically, matching mio's behaviour.
     @discardableResult
     public func reset() -> UInt64 {
         var val: UInt64 = 0
-        let n = withUnsafeMutablePointer(to: &val) { ptr -> Int in
-            Glibc.read(fd, ptr, 8)
+        while true {
+            let n = withUnsafeMutablePointer(to: &val) { ptr -> Int in
+                Glibc.read(fd, ptr, 8)
+            }
+            if n == 8 { return val }
+            if errno == EINTR { continue }
+            // EAGAIN (counter was 0) or any other error → report no
+            // wakeups drained.
+            return 0
         }
-        return n == 8 ? val : 0
     }
 }
 

@@ -13,6 +13,7 @@
 
 import Foundation
 import CMIO
+import Synchronization
 
 #if canImport(Glibc)
 import Glibc
@@ -28,8 +29,46 @@ import Glibc
 public struct PollTimeout: Sendable, Hashable {
     public let rawMilliseconds: CInt
 
+    /// Nanosecond-resolution timeout for `Poll.pollNano`. Only consulted
+    /// when the kernel supports `epoll_pwait2` (Linux 5.11+); ignored
+    /// (with a fall-back to millisecond resolution) otherwise.
+    public let rawNanoseconds: Nanoseconds
+
+    /// `timespec`-style nanosecond timeout component.
+    @frozen
+    public struct Nanoseconds: Sendable, Hashable {
+        /// Seconds. Negative means "block forever".
+        public let sec: Int64
+        /// Nanoseconds within the second. Range: `0 ..< 1_000_000_000`.
+        public let nsec: Int32
+
+        @inlinable public init(sec: Int64, nsec: Int32 = 0) {
+            self.sec = sec
+            self.nsec = nsec
+        }
+    }
+
     @inlinable
-    internal init(raw: CInt) { self.rawMilliseconds = raw }
+    internal init(raw: CInt) {
+        self.rawMilliseconds = raw
+        // Coarse conversion for the nano component — only consulted by
+        // callers who override `rawNanoseconds` explicitly.
+        if raw < 0 {
+            self.rawNanoseconds = Nanoseconds(sec: -1, nsec: 0)
+        } else {
+            let ms = Int64(raw)
+            self.rawNanoseconds = Nanoseconds(
+                sec: ms / 1000,
+                nsec: Int32((ms % 1000) * 1_000_000)
+            )
+        }
+    }
+
+    @inlinable
+    internal init(milliseconds: CInt, nanoseconds: Nanoseconds) {
+        self.rawMilliseconds = milliseconds
+        self.rawNanoseconds = nanoseconds
+    }
 
     public static let blocking   = PollTimeout(raw: -1)
     public static let immediate  = PollTimeout(raw: 0)
@@ -43,6 +82,28 @@ public struct PollTimeout: Sendable, Hashable {
 
     public static func milliseconds(_ ms: CInt) -> PollTimeout {
         return milliseconds(Int(max(0, ms)))
+    }
+
+    /// Nanosecond-resolution timeout. Requires Linux 5.11+ for
+    /// `epoll_pwait2`; on older kernels `Poll.pollNano` falls back to
+    /// millisecond truncation (rounded up to avoid under-shooting).
+    ///
+    /// `sec` may be negative (block forever); `nsec` must be in `0 ..< 1_000_000_000`.
+    public static func nanoseconds(_ sec: Int64, _ nsec: Int32 = 0) -> PollTimeout {
+        precondition(nsec >= 0 && nsec < 1_000_000_000, "nsec out of range")
+        // Ceiling-divide into milliseconds for the fallback path so the
+        // caller never waits less than requested when epoll_pwait2 is
+        // unavailable.
+        let totalNs: Int64 = sec >= 0
+            ? sec * 1_000_000_000 + Int64(nsec)
+            : -1
+        let ms: CInt = totalNs < 0
+            ? -1
+            : CInt((totalNs + 999_999) / 1_000_000)
+        return PollTimeout(
+            milliseconds: ms,
+            nanoseconds: Nanoseconds(sec: sec, nsec: nsec)
+        )
     }
 }
 
@@ -58,7 +119,12 @@ public struct PollTimeout: Sendable, Hashable {
 /// `register`/`reregister`/`deregister` (from any thread) — this is
 /// explicitly permitted by epoll(7). The realistic pattern is one
 /// thread per `Poll`, with cross-thread registration as needed.
-public final class Poll: @unchecked Sendable {
+///
+/// `Sendable` is satisfied structurally: both stored properties are
+/// immutable (`let`) and themselves `Sendable`. The class performs no
+/// shared mutable state of its own — `epoll_ctl` and `epoll_wait` are
+/// thread-safe in the kernel.
+public final class Poll: Sendable {
 
     /// Raw epoll fd. Used by integration tests; production code should
     /// go through `Registry`.
@@ -67,17 +133,32 @@ public final class Poll: @unchecked Sendable {
     /// The registry associated with this poll instance.
     public let registry: Registry
 
+    /// Process-wide cache: `true` once `epoll_pwait2` has returned
+    /// `ENOSYS` (kernel < 5.11) on any `Poll` instance. Subsequent
+    /// `pollNano` calls bypass the syscall entirely and fall back to
+    /// `epoll_wait`. The value can only transition false → true, so a
+    /// racy read on first assignment at worst pays one extra failing
+    /// syscall before the flag latches.
+    private static let pwait2Unavailable = Atomic<Bool>(false)
+
     public init() throws {
         let fd = sl_epoll_create1()
-        // sl_epoll_create1 returns -errno on failure.
+        // sl_epoll_create1 returns either a non-negative fd on success
+        // or `-errno` on failure — race-free errno capture at the C
+        // layer (the C function captures errno before any subsequent
+        // syscall can clobber it).
         guard fd >= 0 else {
-            throw PollError.fromErrno(function: "epoll_create1")
+            throw PollError(code: Int32(-fd), function: "epoll_create1")
         }
         self.epfd = fd
         self.registry = Registry(epfd: fd)
     }
 
     deinit {
+        // `epfd` is a `let` assigned only after a successful `init`;
+        // any throwing init path leaves no `Poll` instance to deinit.
+        // The guard is therefore unreachable in correct usage but kept
+        // defensive against future reinit paths.
         if epfd >= 0 { _ = Glibc.close(epfd) }
     }
 
@@ -123,14 +204,82 @@ public final class Poll: @unchecked Sendable {
             throw PollError(code: Int32(err), function: "epoll_wait")
         }
     }
+
+    /// Nanosecond-resolution variant of `poll`. Uses `epoll_pwait2`
+    /// (Linux 5.11+); on older kernels (or any `ENOSYS` from the
+    /// kernel), silently falls back to millisecond truncation via
+    /// `epoll_wait`. `sigmask` may be `nil` for no signal-mask change.
+    ///
+    /// `EINTR` is retried automatically. Other errors are surfaced as
+    /// `PollError`. The `ENOSYS` result is cached process-wide so the
+    /// fallback path costs one extra branch per call, not one extra
+    /// syscall.
+    @discardableResult
+    public func pollNano(
+        _ events: Events,
+        timeout: PollTimeout,
+        sigmask: UnsafePointer<sigset_t>? = nil
+    ) throws -> Int {
+        // Fast path: a previous call on any Poll discovered that this
+        // kernel lacks epoll_pwait2 — skip straight to the ms fallback.
+        if Poll.pwait2Unavailable.load(ordering: .acquiring) {
+            return try poll(events, timeout: .milliseconds(timeout.rawMilliseconds))
+        }
+
+        while true {
+            let n: CInt
+            // C `long` imports as Swift `Int` on Linux; `unsigned long`
+            // as `UInt`. Convert explicitly to avoid platform-width
+            // ambiguity.
+            let sec: Int = Int(truncatingIfNeeded: timeout.rawNanoseconds.sec)
+            let nsec: Int = Int(timeout.rawNanoseconds.nsec)
+            let sigsetSize: UInt = UInt(MemoryLayout<sigset_t>.size)
+            if let sigmask {
+                n = sl_epoll_pwait2(
+                    epfd,
+                    events._rawBuffer,
+                    CInt(events.capacity),
+                    sec,
+                    nsec,
+                    UnsafeRawPointer(sigmask),
+                    sigsetSize
+                )
+            } else {
+                n = sl_epoll_pwait2(
+                    epfd,
+                    events._rawBuffer,
+                    CInt(events.capacity),
+                    sec,
+                    nsec,
+                    nil,
+                    sigsetSize
+                )
+            }
+            if n >= 0 {
+                events._setDeliveredCount(Int(n))
+                return Int(n)
+            }
+            let err = -n
+            if err == EINTR { continue }
+            if err == ENOSYS {
+                // Kernel too old for epoll_pwait2 — latch process-wide
+                // so future calls bypass the syscall, and fall back.
+                Poll.pwait2Unavailable.store(true, ordering: .releasing)
+                return try poll(events, timeout: .milliseconds(timeout.rawMilliseconds))
+            }
+            events._setDeliveredCount(0)
+            throw PollError(code: Int32(err), function: "epoll_pwait2")
+        }
+    }
 }
 
 /// A handle to a `Poll` exposing only source registration.
 ///
 /// `Registry` is `Equatable` (two registries are equal iff they reference
 /// the same underlying epoll fd) and `Hashable`. It may be shared across
-/// threads.
-public final class Registry: @unchecked Sendable, Hashable {
+/// threads. `Sendable` is structural: the only stored property is an
+/// immutable fd, and `epoll_ctl(2)` is thread-safe.
+public final class Registry: Sendable, Hashable {
     @usableFromInline internal let _epfd: CInt
 
     @usableFromInline internal init(epfd: CInt) {
@@ -148,6 +297,12 @@ public final class Registry: @unchecked Sendable, Hashable {
     public func register(
         fd: CInt, token: Token, interest: Interest
     ) throws {
+        // Reject an unsupported flag combination up-front. The kernel
+        // would also reject this (EINVAL) but the error message would
+        // be opaque; the assertion fires only in debug builds so there
+        // is no release-cost.
+        assert(!(interest.isExclusive && interest.isEdge),
+            "EPOLLEXCLUSIVE may not be combined with EPOLLET (kernel ABI)")
         let rc = sl_epoll_ctl_add(_epfd, fd, interest.rawValue, token.raw)
         if rc != 0 {
             throw PollError(code: Int32(-rc), function: "epoll_ctl(ADD)")
@@ -174,6 +329,20 @@ public final class Registry: @unchecked Sendable, Hashable {
         if rc != 0 {
             throw PollError(code: Int32(-rc), function: "epoll_ctl(DEL)")
         }
+    }
+
+    /// Best-effort deregister. Returns `true` if the fd was successfully
+    /// removed, `false` if the kernel reported `ENOENT` (the fd was not
+    /// registered). Any other error (e.g. `EBADF`) is still surfaced via
+    /// `throw`. Useful in cleanup/deinit paths where the fd may already
+    /// have been removed or recycled.
+    @discardableResult
+    public func tryDeregister(fd: CInt) throws -> Bool {
+        let rc = sl_epoll_ctl_del(_epfd, fd)
+        if rc == 0 { return true }
+        let err = Int32(-rc)
+        if err == ENOENT { return false }
+        throw PollError(code: err, function: "epoll_ctl(DEL)")
     }
 
     // ── Hashable / Equatable — by underlying epfd ──────────────────────

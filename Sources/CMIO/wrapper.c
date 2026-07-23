@@ -47,8 +47,36 @@ int sl_epoll_wait(int epfd, sl_epoll_event *events, int maxevents, int timeout) 
     return n < 0 ? -errno : n;
 }
 
+int sl_epoll_pwait2(
+    int epfd,
+    sl_epoll_event *events,
+    int maxevents,
+    long timeout_sec,
+    long timeout_nsec,
+    const void *sigmask,
+    unsigned long sigsetsize
+) {
+    struct timespec ts;
+    ts.tv_sec  = (time_t)timeout_sec;
+    ts.tv_nsec = (long)timeout_nsec;
+    int n = epoll_pwait2(
+        epfd,
+        (struct epoll_event *)events,
+        maxevents,
+        &ts,
+        (const sigset_t *)sigmask
+    );
+    // Note: `sigsetsize` is accepted by the underlying syscall but glibc's
+    // epoll_pwait2 wrapper does not expose it — `sizeof(sigset_t)` is used
+    // internally. The parameter remains in our shim for forward compat
+    // with raw syscall() invocations.
+    (void)sigsetsize;
+    return n < 0 ? -errno : n;
+}
+
 int sl_eventfd(unsigned int initval, int flags) {
-    return eventfd(initval, flags);
+    int fd = eventfd(initval, flags);
+    return fd < 0 ? -errno : fd;
 }
 
 #endif /* __linux__ */

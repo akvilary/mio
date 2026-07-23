@@ -42,6 +42,10 @@ public struct Event: Sendable, Hashable, CustomStringConvertible {
     @inlinable
     public var isError: Bool { ready.isError }
     @inlinable
+    public var isHangup: Bool { ready.isHangup }
+    @inlinable
+    public var isPriority: Bool { ready.contains(.priority) }
+    @inlinable
     public var isReadClosed: Bool { ready.isReadClosed }
     @inlinable
     public var isWriteClosed: Bool { ready.isWriteClosed }
@@ -55,10 +59,14 @@ public struct Event: Sendable, Hashable, CustomStringConvertible {
 /// that `epoll_wait(2)` writes into directly — zero allocation per poll.
 /// Call `clear()` between iterations (costs one int store).
 ///
-/// `Events` is `@unchecked Sendable`: instances are not safe to share
-/// across threads but, like mio's `Events`, are intended to be stack-
-/// allocated per worker thread.
-public final class Events: @unchecked Sendable {
+/// **Threading contract:** `Events` is intentionally **not** `Sendable`.
+/// It is meant to be stack-allocated (or held in a single-thread field)
+/// on the worker thread that calls `Poll.poll`. The kernel writes the
+/// delivered-event count into `_count` on each poll; concurrent reads
+/// from another thread would race. If you need to share an `Events`
+/// across threads, wrap it in `Mutex<Events>` (from `Synchronization`)
+/// — but you almost certainly want one `Events` per worker instead.
+public final class Events {
 
     // Raw kernel-write buffer. Allocated once, lives for the lifetime of
     // the container. 12 bytes per slot.
@@ -85,6 +93,10 @@ public final class Events: @unchecked Sendable {
     }
 
     deinit {
+        // `sl_epoll_event` is a trivial C struct (no retainable members),
+        // so `deinitialize` is technically a no-op — but paired with the
+        // `initialize` above for symmetry and to keep the pointer pattern
+        // safe under future changes to the element type.
         buffer.deinitialize(count: capacity)
         buffer.deallocate()
     }
@@ -99,9 +111,18 @@ public final class Events: @unchecked Sendable {
     @inlinable
     public func clear() { _count = 0 }
 
-    /// Access the i-th event. Caller is responsible for `i < count`.
+    /// Access the i-th event. Traps on out-of-bounds `position`
+    /// (debug: assertion; release: traps via UnsafeMutablePointer).
+    ///
+    /// Performance: the precondition is checked even in release builds
+    /// because the kernel-fed `_count` is the only correctness boundary
+    /// — a stale or wrong `position` from a caller would otherwise read
+    /// uninitialised memory. The check is a single compare+branch per
+    /// access, dominated by the cost of the surrounding work.
     @inlinable
     public subscript(position: Int) -> Event {
+        precondition(position >= 0 && position < _count,
+            "Events.subscript: position \(position) out of range 0..<\(_count)")
         let raw = buffer[position]
         return Event(token: Token(raw.data), ready: Ready(rawValue: raw.events))
     }

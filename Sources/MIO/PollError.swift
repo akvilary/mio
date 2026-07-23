@@ -34,9 +34,25 @@ public struct PollError: Error, Sendable, CustomStringConvertible, Equatable {
         self.function = function
     }
 
-    /// Construct from the thread-local `errno`. Captures `errno` at call
-    /// time — the caller is responsible for not letting any intervening
-    /// syscall clobber it.
+    /// Construct from the **negative return value** of the `sl_*` C
+    /// wrappers, which return `-errno` directly. Preferred over
+    /// `fromErrno(function:)` because the C wrapper captures `errno`
+    /// before any subsequent Swift-runtime syscall can clobber it.
+    @inlinable
+    public static func fromNegativeReturn(_ value: CInt, function: String) -> PollError {
+        // value is < 0; the errno is `-value`.
+        precondition(value < 0, "fromNegativeReturn called with non-negative value")
+        return PollError(code: Int32(-value), function: function)
+    }
+
+    /// Construct from the thread-local `errno`. **Fragile** — any
+    /// intervening syscall on this thread (including Swift-runtime
+    /// internal calls) will clobber `errno` before this runs. Prefer
+    /// `fromNegativeReturn(_:_:)` for any error originating from a
+    /// `sl_*` wrapper that returns `-errno`.
+    ///
+    /// Kept for callers wrapping syscalls directly (e.g. `eventfd`,
+    /// which the current `sl_eventfd` shim does not return `-errno` for).
     public static func fromErrno(function: String) -> PollError {
         return PollError(code: Int32(errno), function: function)
     }

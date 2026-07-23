@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.2
 //
 //  mio — a Swift port of Rust's mio (https://github.com/tokio-rs/mio):
 //  lightweight, portable readiness-based I/O primitives backed by epoll

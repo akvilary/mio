@@ -59,6 +59,24 @@ public struct Interest: OptionSet, Sendable, Hashable, CustomStringConvertible {
     /// until re-armed via `Registry.reregister`.
     public static let oneshot = Interest(rawValue: 0x4000_0000)
 
+    /// Exclusive wakeups (`EPOLLEXCLUSIVE`, Linux 4.5+). When multiple
+    /// epolls (or multiple threads sharing one epoll via `Poll.registry`)
+    /// register the same fd with `.exclusive`, the kernel delivers each
+    /// event to **at most one** waiter — preventing thundering herd on
+    /// the accept path. Mutually beneficial with `SO_REUSEPORT` but the
+    /// primary use case is **shared-listener** multi-process servers
+    /// (where `SO_REUSEPORT` is unavailable or undesirable).
+    ///
+    /// Restrictions (kernel-imposed):
+    ///   - May NOT be combined with `.edge`; must be level-triggered.
+    ///   - May NOT be set via `reregister` — must be present at the
+    ///     initial `register` call (the kernel silently ignores later
+    ///     attempts to add it).
+    ///   - For `accept(2)`-style events only — semantics with `read`/
+    ///     `write` are not what most callers expect (events may still
+    ///     queue if the same fd is registered multiple times).
+    public static let exclusive = Interest(rawValue: 0x1000_0000)
+
     // ── Convenience compositions ───────────────────────────────────────
 
     /// Both readable and writable. Convenience for `[.readable, .writable]`.
@@ -80,6 +98,9 @@ public struct Interest: OptionSet, Sendable, Hashable, CustomStringConvertible {
     @inlinable
     public var isOneshot: Bool { contains(.oneshot) }
 
+    @inlinable
+    public var isExclusive: Bool { contains(.exclusive) }
+
     public var description: String {
         var parts: [String] = []
         if isReadable { parts.append("readable") }
@@ -87,6 +108,7 @@ public struct Interest: OptionSet, Sendable, Hashable, CustomStringConvertible {
         if contains(.priority) { parts.append("priority") }
         if isEdge { parts.append("edge") }
         if isOneshot { parts.append("oneshot") }
+        if isExclusive { parts.append("exclusive") }
         return "Interest(\(parts.joined(separator: " | ")))"
     }
 }
