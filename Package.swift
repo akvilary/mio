@@ -38,13 +38,30 @@ let package = Package(
         .target(
             name: "MIO",
             dependencies: ["CMIO"],
-            path: "Sources/MIO"
+            path: "Sources/MIO",
+            swiftSettings: baseSwiftSettings
         ),
 
         .testTarget(
             name: "MIOTests",
             dependencies: ["MIO"],
-            path: "Tests/MIOTests"
+            path: "Tests/MIOTests",
+            swiftSettings: baseSwiftSettings
         ),
     ]
 )
+
+// Swift 6.2 settings — load-bearing for compatibility with downstream
+// consumers (starlight) that enable the same experimental features.
+// Without these, methods on `~Copyable` types in MIO are silently
+// hidden from consumers with stricter memory-safety / lifetime flags
+// (verified empirically: Swift 6.2's type checker refuses to expose
+// `mutating` methods on `~Copyable` structs across module boundaries
+// unless the consumer's experimental-feature set matches the producer's).
+var baseSwiftSettings: [SwiftSetting] {
+    [
+        .enableUpcomingFeature("NonisolatedNonsendingByDefault"),
+        .enableExperimentalFeature("Lifetimes"),
+        .enableExperimentalFeature("StrictMemorySafety"),
+    ]
+}

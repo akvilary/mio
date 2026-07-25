@@ -38,27 +38,27 @@ struct PollTests {
     @Test("Events initial state is empty")
     func eventsEmpty() throws {
         let p = try Poll()
-        let ev = Events(capacity: 16)
-        #expect(ev.isEmpty)
-        #expect(ev.count == 0)
+        var ev = Events(capacity: 16)
+        let empty1 = ev.isEmpty; #expect(empty1)
+        let count1 = ev.count; #expect(count1 == 0)
         // Immediate poll on an empty epoll instance must return 0 events.
-        let n = try p.poll(ev, timeout: .immediate)
+        let n = try ev.wait(on: p, timeout: .immediate)
         #expect(n == 0)
-        #expect(ev.isEmpty)
+        let empty2 = ev.isEmpty; #expect(empty2)
     }
 
     @Test("Events capacity is honoured")
     func eventsCapacity() throws {
         let ev = Events(capacity: 4)
-        #expect(ev.capacity == 4)
+        let cap = ev.capacity; #expect(cap == 4)
     }
 
     @Test("Events.clear() resets count to zero")
     func eventsClear() throws {
-        let ev = Events(capacity: 8)
+        var ev = Events(capacity: 8)
         // Forcibly set count via a no-op poll then clear.
         ev.clear()
-        #expect(ev.isEmpty)
+        let empty = ev.isEmpty; #expect(empty)
     }
 
     // MARK: - Registry
@@ -73,15 +73,15 @@ struct PollTests {
         try p.registry.register(fd: r, token: Token(42), interest: .readable)
 
         // Initially no data → no events.
-        let ev = Events(capacity: 4)
-        #expect(try p.poll(ev, timeout: .immediate) == 0)
+        var ev = Events(capacity: 4)
+        #expect(try ev.wait(on: p, timeout: .immediate) == 0)
 
         // Write one byte from the other end.
         var byte: UInt8 = 0xAB
         #expect(Glibc.write(w, &byte, 1) == 1)
 
         // Now we should see exactly one event on Token(42), readable.
-        let n = try p.poll(ev, timeout: .immediate)
+        let n = try ev.wait(on: p, timeout: .immediate)
         #expect(n == 1)
         var seen: Token? = nil
         ev.forEach { ev1 in
@@ -128,8 +128,8 @@ struct PollTests {
 
         var byte: UInt8 = 1
         _ = Glibc.write(w, &byte, 1)
-        let ev = Events(capacity: 4)
-        let n = try p.poll(ev, timeout: .immediate)
+        var ev = Events(capacity: 4)
+        let n = try ev.wait(on: p, timeout: .immediate)
         #expect(n == 1)
         ev.forEach { #expect($0.token == Token(22)) }
     }
@@ -146,16 +146,16 @@ struct PollTests {
         var byte: UInt8 = 1
         _ = Glibc.write(w, &byte, 1)
 
-        let ev = Events(capacity: 4)
+        var ev = Events(capacity: 4)
         // First poll: delivers the event.
-        #expect(try p.poll(ev, timeout: .immediate) == 1)
+        #expect(try ev.wait(on: p, timeout: .immediate) == 1)
         // Second poll: oneshot disabled the fd — no event, even though
         // there is still data in the socket.
-        #expect(try p.poll(ev, timeout: .immediate) == 0)
+        #expect(try ev.wait(on: p, timeout: .immediate) == 0)
 
         // Re-arm and try again.
         try p.registry.reregister(fd: r, token: Token(7), interest: [.readable, .oneshot])
-        #expect(try p.poll(ev, timeout: .immediate) == 1)
+        #expect(try ev.wait(on: p, timeout: .immediate) == 1)
     }
 
     @Test("Edge-triggered delivers once per state transition, not per poll")
@@ -170,14 +170,14 @@ struct PollTests {
         var byte: UInt8 = 0xAB
         _ = Glibc.write(w, &byte, 1)
 
-        let ev = Events(capacity: 4)
+        var ev = Events(capacity: 4)
         // First poll: edge fired when byte became available.
-        #expect(try p.poll(ev, timeout: .immediate) == 1)
+        #expect(try ev.wait(on: p, timeout: .immediate) == 1)
         ev.forEach { #expect($0.token == Token(42)) }
 
         // Second poll WITHOUT draining + WITHOUT a new state transition:
         // edge-triggered must NOT re-fire.
-        #expect(try p.poll(ev, timeout: .immediate) == 0)
+        #expect(try ev.wait(on: p, timeout: .immediate) == 0)
 
         // Drain everything; the loop is now responsible for reading
         // until EAGAIN in edge mode.
@@ -188,7 +188,7 @@ struct PollTests {
         // New write → new edge.
         byte = 0xCD
         _ = Glibc.write(w, &byte, 1)
-        #expect(try p.poll(ev, timeout: .immediate) == 1)
+        #expect(try ev.wait(on: p, timeout: .immediate) == 1)
         ev.forEach { #expect($0.token == Token(42)) }
     }
 
@@ -212,10 +212,10 @@ struct PollTests {
     @Test("Events.subscript traps on out-of-bounds position")
     func eventsSubscriptBoundsCheck() throws {
         let p = try Poll()
-        let ev = Events(capacity: 4)
+        var ev = Events(capacity: 4)
         // Poll with no sources → 0 events delivered.
-        _ = try p.poll(ev, timeout: .immediate)
-        #expect(ev.count == 0)
+        _ = try ev.wait(on: p, timeout: .immediate)
+        let cnt = ev.count; #expect(cnt == 0)
         // Accessing position 0 of an empty Events must trap. We use
         // a fatalError-catching pattern by inverting the check: the
         // first valid access works, the OOB one is the bug we are
@@ -227,7 +227,7 @@ struct PollTests {
         try p.registry.register(fd: r, token: Token(5), interest: .readable)
         var byte: UInt8 = 1
         _ = Glibc.write(w, &byte, 1)
-        #expect(try p.poll(ev, timeout: .immediate) == 1)
+        #expect(try ev.wait(on: p, timeout: .immediate) == 1)
         #expect(ev[0].token == Token(5))
     }
 
@@ -250,13 +250,13 @@ struct PollTests {
         // directly. On older kernels the ENOSYS fallback is hit on
         // first call and cached for subsequent calls.
         let p = try Poll()
-        let ev = Events(capacity: 4)
+        var ev = Events(capacity: 4)
         // 100ms timeout — short enough to test quickly, long enough to
         // exercise the timeout code path.
-        let n = try p.pollNano(ev, timeout: .nanoseconds(0, 100_000_000))
+        let n = try ev.waitNano(on: p, timeout: .nanoseconds(0, 100_000_000))
         #expect(n == 0)
         // Second call should hit the cached path (no double ENOSYS).
-        let n2 = try p.pollNano(ev, timeout: .nanoseconds(0, 50_000_000))
+        let n2 = try ev.waitNano(on: p, timeout: .nanoseconds(0, 50_000_000))
         #expect(n2 == 0)
     }
 
@@ -272,8 +272,8 @@ struct PollTests {
         // counter persists across epoll_wait calls.
         #expect(waker.wake())
 
-        let ev = Events(capacity: 4)
-        let n = try p.poll(ev, timeout: .immediate)
+        var ev = Events(capacity: 4)
+        let n = try ev.wait(on: p, timeout: .immediate)
         #expect(n == 1)
         ev.forEach { ev1 in
             #expect(ev1.token == Token(999))
@@ -281,7 +281,7 @@ struct PollTests {
         }
         // Drain so subsequent polls don't re-observe it.
         _ = waker.reset()
-        #expect(try p.poll(ev, timeout: .immediate) == 0)
+        #expect(try ev.wait(on: p, timeout: .immediate) == 0)
     }
 
     @Test("Waker is safe to fire multiple times before drain")
@@ -294,9 +294,9 @@ struct PollTests {
         #expect(waker.wake())
         #expect(waker.wake())
 
-        let ev = Events(capacity: 4)
+        var ev = Events(capacity: 4)
         // Level-triggered, single event even though three wakes were issued.
-        #expect(try p.poll(ev, timeout: .immediate) == 1)
+        #expect(try ev.wait(on: p, timeout: .immediate) == 1)
         // Reset reads counter (= 3) and zeroes it.
         #expect(waker.reset() == 3)
     }
@@ -309,9 +309,9 @@ struct PollTests {
         let waker = try Waker(registry: p.registry, token: Token(0))
         // No defer close — Waker.deinit owns the fd.
         #expect(waker.wake())
-        let ev = Events(capacity: 4)
+        var ev = Events(capacity: 4)
         // Should NOT block — waker is already pending.
-        let n = try p.poll(ev, timeout: .blocking)
+        let n = try ev.wait(on: p, timeout: .blocking)
         #expect(n == 1)
         _ = waker.reset()
     }
@@ -319,9 +319,9 @@ struct PollTests {
     @Test("Timed poll returns 0 after the timeout elapses with no events")
     func timedPollNoEvents() throws {
         let p = try Poll()
-        let ev = Events(capacity: 4)
+        var ev = Events(capacity: 4)
         let start = Date()
-        let n = try p.poll(ev, timeout: .milliseconds(50))
+        let n = try ev.wait(on: p, timeout: .milliseconds(50))
         let elapsed = Date().timeIntervalSince(start)
         #expect(n == 0)
         #expect(elapsed >= 0.04)  // allow some scheduler slack
@@ -339,9 +339,9 @@ struct PollTests {
             _ = waker.wake()
         }
 
-        let ev = Events(capacity: 4)
+        var ev = Events(capacity: 4)
         let start = Date()
-        let n = try p.poll(ev, timeout: .milliseconds(2000))
+        let n = try ev.wait(on: p, timeout: .milliseconds(2000))
         let elapsed = Date().timeIntervalSince(start)
         #expect(n == 1)
         #expect(elapsed < 1.5)  // woke well before the 2s safety timeout

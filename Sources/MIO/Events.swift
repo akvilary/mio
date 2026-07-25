@@ -59,17 +59,25 @@ public struct Event: Sendable, Hashable, CustomStringConvertible {
 /// that `epoll_wait(2)` writes into directly — zero allocation per poll.
 /// Call `clear()` between iterations (costs one int store).
 ///
-/// **Threading contract:** `Events` is intentionally **not** `Sendable`.
-/// It is meant to be stack-allocated (or held in a single-thread field)
-/// on the worker thread that calls `Poll.poll`. The kernel writes the
-/// delivered-event count into `_count` on each poll; concurrent reads
-/// from another thread would race. If you need to share an `Events`
-/// across threads, wrap it in `Mutex<Events>` (from `Synchronization`)
-/// — but you almost certainly want one `Events` per worker instead.
-public final class Events {
-
+/// **Ownership model (Swift 6.2):** `Events` is **move-only** (`~Copyable`)
+/// and **not** `Sendable`. The compiler enforces single-owner single-thread
+/// access at compile time — an `Events` value cannot be aliased, copied
+/// into a closure escape, or shared across actor boundaries. This is the
+/// idiomatic Swift 6.2 expression of the single-thread contract that
+/// `@unchecked Sendable` previously claimed (without proof) on the
+/// class form.
+///
+/// Concretely:
+///   - Construct one `Events` per worker thread.
+///   - Pass it to `Poll.poll(_:timeout:)` via `inout`:
+///     `try poll.poll(&events, timeout: .blocking)`.
+///   - Iterate via `forEach` (borrowing) or `subscript` (borrowing).
+///   - Mutate via `clear()` or another `poll` call (both `mutating`).
+///   - On scope exit, the `consuming deinit` releases the kernel-write
+///     buffer automatically — no explicit deallocation required.
+public struct Events: ~Copyable {
     // Raw kernel-write buffer. Allocated once, lives for the lifetime of
-    // the container. 12 bytes per slot.
+    // the value. 12 bytes per slot.
     //
     // `@usableFromInline` so the `@inlinable` `forEach`/`subscript` below
     // (consumed across the module boundary by hot loops in e.g. an event
@@ -82,9 +90,6 @@ public final class Events {
 
     public init(capacity: Int) {
         precondition(capacity > 0, "Events capacity must be > 0")
-        // Round up to at least one cache line's worth (16 × 12 B = 192 B) to
-        // amortise allocation; epoll_wait will still only fill up to the
-        // requested capacity.
         self.capacity = capacity
         self.buffer = .allocate(capacity: capacity)
         // Poison with zeros so a missed clear() never surfaces a stale
@@ -92,11 +97,16 @@ public final class Events {
         buffer.initialize(repeating: sl_epoll_event(), count: capacity)
     }
 
+    /// Releases the kernel-write buffer. Invoked automatically when the
+    /// value goes out of scope or its owning class (e.g. `PollEventLoop`)
+    /// deinitializes. For a `~Copyable` struct, `deinit` is implicitly
+    /// consuming — the value is destroyed after this runs.
+    ///
+    /// `sl_epoll_event` is a trivial C struct, so the `deinitialize` is
+    /// a no-op in practice — kept for symmetry with the `initialize`
+    /// above and forward-safety if the element type ever carries
+    /// retainable members.
     deinit {
-        // `sl_epoll_event` is a trivial C struct (no retainable members),
-        // so `deinitialize` is technically a no-op — but paired with the
-        // `initialize` above for symmetry and to keep the pointer pattern
-        // safe under future changes to the element type.
         buffer.deinitialize(count: capacity)
         buffer.deallocate()
     }
@@ -109,7 +119,7 @@ public final class Events {
     /// Reset the visible event count to zero. Does not scrub the buffer —
     /// the kernel will overwrite entries on the next `poll`. O(1).
     @inlinable
-    public func clear() { _count = 0 }
+    public mutating func clear() { _count = 0 }
 
     /// Access the i-th event. Traps on out-of-bounds `position`
     /// (debug: assertion; release: traps via UnsafeMutablePointer).
@@ -119,6 +129,9 @@ public final class Events {
     /// — a stale or wrong `position` from a caller would otherwise read
     /// uninitialised memory. The check is a single compare+branch per
     /// access, dominated by the cost of the surrounding work.
+    ///
+    /// Read-only subscripts on a `~Copyable` struct borrow `self` for
+    /// the duration of the access — the caller retains ownership.
     @inlinable
     public subscript(position: Int) -> Event {
         precondition(position >= 0 && position < _count,
@@ -131,9 +144,11 @@ public final class Events {
     ///
     /// `@inlinable` so the per-event dispatch closure supplied by an event
     /// loop is inlined into the loop body, avoiding an indirect call per
-    /// event across the module boundary.
+    /// event across the module boundary. Borrowing: the iteration does
+    /// not consume `self`; the caller retains ownership for a subsequent
+    /// `poll` or `clear`.
     @inlinable
-    public func forEach(_ body: (Event) -> Void) {
+    public borrowing func forEach(_ body: (Event) -> Void) {
         for i in 0..<_count {
             let raw = buffer[i]
             body(Event(token: Token(raw.data), ready: Ready(rawValue: raw.events)))
@@ -142,7 +157,9 @@ public final class Events {
 
     /// Returns an array copy of the delivered events. Use sparingly —
     /// prefer `forEach(_:)` to avoid allocation in the hot path.
-    public func toArray() -> [Event] {
+    ///
+    /// Borrowing: the source `Events` remains usable after this call.
+    public borrowing func toArray() -> [Event] {
         var out: [Event] = []
         out.reserveCapacity(_count)
         forEach { out.append($0) }
@@ -151,13 +168,119 @@ public final class Events {
 
     // ── Internal: used by Poll to write into the raw buffer ─────────────
 
+    /// Pointer to the kernel-write buffer. **Unsafe:** the returned
+    /// pointer is valid only while the borrowing caller holds `self`
+    /// alive; do not escape it across the call's lifetime.
     @usableFromInline
     internal var _rawBuffer: UnsafeMutablePointer<sl_epoll_event> { buffer }
 
     @usableFromInline
-    internal func _setDeliveredCount(_ n: Int) {
+    internal mutating func _setDeliveredCount(_ n: Int) {
         precondition(n >= 0 && n <= capacity)
         _count = n
+    }
+
+    // ── Poll integration ──────────────────────────────────────────────
+    //
+    // `wait(on:timeout:)` is a `mutating` method on `Events` itself
+    // (not an extension) because `~Copyable` types' extension methods
+    // are not reliably visible across module boundaries in current
+    // Swift 6.2. Inlining the methods into the type declaration makes
+    // them part of the canonical interface and exportable normally.
+    //
+    // The methods need `epfd` from `Poll`; they take it as a parameter
+    // rather than capturing `Poll` to keep `Events` independent of the
+    // `Poll` type's storage layout.
+
+    /// Block until at least one registered source becomes ready, then
+    /// write up to `capacity` events into `self`. Returns the number
+    /// of delivered events (0 on timeout).
+    ///
+    /// **Blocking syscall.** Calls `epoll_wait(2)`, which may block
+    /// indefinitely with `timeout: .blocking`. Do NOT call from Swift's
+    /// cooperative thread pool — use a dedicated `Thread` or an actor
+    /// with a custom `SerialExecutor` (see `PollEventLoop` in the
+    /// `starlight` package for a reference implementation).
+    ///
+    /// `EINTR` is retried automatically; all other errors surface as
+    /// `PollError`.
+    @discardableResult
+    public mutating func wait(
+        on poll: Poll,
+        timeout: PollTimeout = .blocking
+    ) throws -> Int {
+        while true {
+            let n = sl_epoll_wait(
+                poll.epfd,
+                _rawBuffer,
+                CInt(capacity),
+                timeout.rawMilliseconds
+            )
+            if n >= 0 {
+                _setDeliveredCount(Int(n))
+                return Int(n)
+            }
+            let err = -n
+            if err == EINTR { continue }
+            _setDeliveredCount(0)
+            throw PollError(code: Int32(err), function: "epoll_wait")
+        }
+    }
+
+    /// Nanosecond-resolution variant of `wait`. Uses `epoll_pwait2`
+    /// (Linux 5.11+); on older kernels (or any `ENOSYS` from the
+    /// kernel), silently falls back to millisecond truncation via
+    /// `epoll_wait`. `sigmask` may be `nil` for no signal-mask change.
+    ///
+    /// Same blocking-syscall caveat as `wait(on:timeout:)`.
+    @discardableResult
+    public mutating func waitNano(
+        on poll: Poll,
+        timeout: PollTimeout,
+        sigmask: UnsafePointer<sigset_t>? = nil
+    ) throws -> Int {
+        if Poll.pwait2Unavailable.load(ordering: .acquiring) {
+            return try wait(on: poll, timeout: .milliseconds(timeout.rawMilliseconds))
+        }
+        while true {
+            let sec: Int = Int(truncatingIfNeeded: timeout.rawNanoseconds.sec)
+            let nsec: Int = Int(timeout.rawNanoseconds.nsec)
+            let sigsetSize: UInt = UInt(MemoryLayout<sigset_t>.size)
+            let n: CInt
+            if let sigmask {
+                n = sl_epoll_pwait2(
+                    poll.epfd,
+                    _rawBuffer,
+                    CInt(capacity),
+                    sec,
+                    nsec,
+                    UnsafeRawPointer(sigmask),
+                    sigsetSize
+                )
+            } else {
+                n = sl_epoll_pwait2(
+                    poll.epfd,
+                    _rawBuffer,
+                    CInt(capacity),
+                    sec,
+                    nsec,
+                    nil,
+                    sigsetSize
+                )
+            }
+            if n >= 0 {
+                _setDeliveredCount(Int(n))
+                return Int(n)
+            }
+            let err = -n
+            if err == EINTR { continue }
+            if err == ENOSYS {
+                Poll.pwait2Unavailable.store(true, ordering: .releasing)
+                return try wait(on: poll, timeout: .milliseconds(timeout.rawMilliseconds))
+            }
+            _setDeliveredCount(0)
+            throw PollError(code: Int32(err), function: "epoll_pwait2")
+        }
     }
 }
 

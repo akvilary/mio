@@ -139,7 +139,7 @@ public final class Poll: Sendable {
     /// `epoll_wait`. The value can only transition false → true, so a
     /// racy read on first assignment at worst pays one extra failing
     /// syscall before the flag latches.
-    private static let pwait2Unavailable = Atomic<Bool>(false)
+    internal static let pwait2Unavailable = Atomic<Bool>(false)
 
     public init() throws {
         let fd = sl_epoll_create1()
@@ -170,39 +170,23 @@ public final class Poll: Sendable {
     ///
     /// `EINTR` is retried automatically — callers never see it. All other
     /// errors are surfaced as `PollError`.
+    ///
+    /// **Blocking syscall.** `poll` calls `epoll_wait(2)` which may
+    /// block indefinitely with `timeout: .blocking`. Do NOT call from
+    /// Swift's cooperative thread pool — use a dedicated `Thread` or an
+    /// actor with a custom `SerialExecutor` (see `PollEventLoop` in the
+    /// `starlight` package for a reference implementation).
+    ///
+    /// This is the imperative form for callers who hold `Events` as a
+    /// stack-local `var`. For `Events` stored as a class field (where
+    /// `&self.events` is not expressible), prefer the OO form
+    /// `events.wait(on: poll, timeout:)`.
     @discardableResult
     public func poll(
-        _ events: Events,
+        _ events: inout Events,
         timeout: PollTimeout = .blocking
     ) throws -> Int {
-        // Note: `events` is a reference type; the new count is observable
-        // to the caller without `inout`.
-        while true {
-            let n = sl_epoll_wait(
-                epfd,
-                events._rawBuffer,
-                CInt(events.capacity),
-                timeout.rawMilliseconds
-            )
-            if n >= 0 {
-                events._setDeliveredCount(Int(n))
-                return Int(n)
-            }
-            // n < 0 ⇒ the C wrapper has already folded errno into the
-            // return value as -errno.
-            let err = -n
-            if err == EINTR {
-                // Interrupted by a signal — retry. The caller's effective
-                // timeout may be shortened by the time spent blocked
-                // before the signal; for an event loop that retries
-                // immediately this is the correct behaviour. Callers
-                // needing precise timeout accounting should use
-                // `.immediate` and their own clock.
-                continue
-            }
-            events._setDeliveredCount(0)
-            throw PollError(code: Int32(err), function: "epoll_wait")
-        }
+        try events.wait(on: self, timeout: timeout)
     }
 
     /// Nanosecond-resolution variant of `poll`. Uses `epoll_pwait2`
@@ -214,62 +198,17 @@ public final class Poll: Sendable {
     /// `PollError`. The `ENOSYS` result is cached process-wide so the
     /// fallback path costs one extra branch per call, not one extra
     /// syscall.
+    ///
+    /// **Blocking syscall** — same cooperative-thread-pool caveat as
+    /// `poll(_:timeout:)` applies. For class-stored `Events`, use
+    /// `events.waitNano(on:timeout:sigmask:)` instead.
     @discardableResult
     public func pollNano(
-        _ events: Events,
+        _ events: inout Events,
         timeout: PollTimeout,
         sigmask: UnsafePointer<sigset_t>? = nil
     ) throws -> Int {
-        // Fast path: a previous call on any Poll discovered that this
-        // kernel lacks epoll_pwait2 — skip straight to the ms fallback.
-        if Poll.pwait2Unavailable.load(ordering: .acquiring) {
-            return try poll(events, timeout: .milliseconds(timeout.rawMilliseconds))
-        }
-
-        while true {
-            let n: CInt
-            // C `long` imports as Swift `Int` on Linux; `unsigned long`
-            // as `UInt`. Convert explicitly to avoid platform-width
-            // ambiguity.
-            let sec: Int = Int(truncatingIfNeeded: timeout.rawNanoseconds.sec)
-            let nsec: Int = Int(timeout.rawNanoseconds.nsec)
-            let sigsetSize: UInt = UInt(MemoryLayout<sigset_t>.size)
-            if let sigmask {
-                n = sl_epoll_pwait2(
-                    epfd,
-                    events._rawBuffer,
-                    CInt(events.capacity),
-                    sec,
-                    nsec,
-                    UnsafeRawPointer(sigmask),
-                    sigsetSize
-                )
-            } else {
-                n = sl_epoll_pwait2(
-                    epfd,
-                    events._rawBuffer,
-                    CInt(events.capacity),
-                    sec,
-                    nsec,
-                    nil,
-                    sigsetSize
-                )
-            }
-            if n >= 0 {
-                events._setDeliveredCount(Int(n))
-                return Int(n)
-            }
-            let err = -n
-            if err == EINTR { continue }
-            if err == ENOSYS {
-                // Kernel too old for epoll_pwait2 — latch process-wide
-                // so future calls bypass the syscall, and fall back.
-                Poll.pwait2Unavailable.store(true, ordering: .releasing)
-                return try poll(events, timeout: .milliseconds(timeout.rawMilliseconds))
-            }
-            events._setDeliveredCount(0)
-            throw PollError(code: Int32(err), function: "epoll_pwait2")
-        }
+        try events.waitNano(on: self, timeout: timeout, sigmask: sigmask)
     }
 }
 
