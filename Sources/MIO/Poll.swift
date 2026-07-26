@@ -93,7 +93,8 @@ public struct PollTimeout: Sendable, Hashable {
         precondition(nsec >= 0 && nsec < 1_000_000_000, "nsec out of range")
         // Ceiling-divide into milliseconds for the fallback path so the
         // caller never waits less than requested when epoll_pwait2 is
-        // unavailable.
+        // unavailable. Swift traps on Int64 overflow, so an absurd
+        // timeout (>292 years) crashes rather than silently wrapping.
         let totalNs: Int64 = sec >= 0
             ? sec * 1_000_000_000 + Int64(nsec)
             : -1
@@ -124,6 +125,14 @@ public struct PollTimeout: Sendable, Hashable {
 /// immutable (`let`) and themselves `Sendable`. The class performs no
 /// shared mutable state of its own — `epoll_ctl` and `epoll_wait` are
 /// thread-safe in the kernel.
+///
+/// **Lifetime contract:** `Poll` owns the epoll fd and closes it in
+/// `deinit`. `Registry` is a lightweight handle that does NOT keep
+/// `Poll` alive — it stores only the raw fd integer. The caller MUST
+/// keep `Poll` alive as long as any `Registry` or `Waker` is in use;
+/// otherwise `epoll_ctl`/`epoll_wait` calls on the closed fd will
+/// return `EBADF`. In Rust's mio this is enforced by the borrow checker
+/// (`Registry` borrows `Poll`); in Swift it is a runtime contract.
 public final class Poll: Sendable {
 
     /// Raw epoll fd. Used by integration tests; production code should
