@@ -204,6 +204,11 @@ public struct Events: ~Copyable {
     ///
     /// `EINTR` is retried automatically; all other errors surface as
     /// `PollError`.
+    ///
+    /// **Timeout caveat:** the EINTR retry does NOT account for time
+    /// already spent blocked before the signal. A `.milliseconds(5000)`
+    /// interrupted at 4999 ms will re-block for another 5000 ms. For
+    /// precise timeout accounting, use `.immediate` + your own clock.
     @discardableResult
     public mutating func wait(
         on poll: Poll,

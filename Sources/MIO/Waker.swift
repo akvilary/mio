@@ -33,6 +33,13 @@ import Glibc
 /// is the kernel's responsibility: eventfd's counter saturates at
 /// `UINT64_MAX - 1` and a write into a full counter fails with
 /// `EAGAIN`).
+///
+/// **Lifetime contract:** the caller MUST keep the `Waker` alive while
+/// `wake()` may be called from another thread. If the last reference is
+/// dropped while a `wake()` is in flight, `deinit`'s `close(fd)` races
+/// with `write(fd, ...)`. In practice the event loop owns the `Waker`
+/// for the entire lifetime of any Task that may call `wake()`, so this
+/// is satisfied automatically.
 public final class Waker: Sendable {
 
     /// The raw eventfd. Read-only diagnostic accessor.
@@ -83,26 +90,30 @@ public final class Waker: Sendable {
     ///
     /// Safe to call from any thread. Multiple wakes may coalesce; if the
     /// counter is full (saturated at `UINT64_MAX - 1`) the write fails
-    /// with `EAGAIN`, which is treated as success — the waker has
-    /// already been fired and not yet drained, which is exactly what
-    /// the caller wanted.
+    /// with `EAGAIN` — the waker has already been fired and not yet
+    /// drained, so functionally the wakeup IS delivered and we return
+    /// `true`.
     ///
     /// `EINTR` (signal interrupted the syscall before any bytes were
     /// written) is retried automatically, matching mio's behaviour.
+    /// `EBADF` (fd closed) or `EINVAL` (fd not eventfd) return `false`.
     @discardableResult
     public func wake() -> Bool {
         var val: UInt64 = 1
-        // Retry loop: EINTR on eventfd leaves the counter untouched, so
-        // we must retry to actually deliver the wakeup. EAGAIN (counter
-        // full) returns false — but the previous wake still hasn't been
-        // drained, so functionally equivalent to success.
         while true {
             let n = withUnsafePointer(to: &val) { ptr -> Int in
                 Glibc.write(fd, ptr, 8)
             }
             if n == 8 { return true }
-            if errno == EINTR { continue }
-            // EAGAIN, EBADF (closed), EINVAL — treat as not-delivered.
+            let err = errno
+            if err == EINTR { continue }
+            if err == EAGAIN || err == EWOULDBLOCK {
+                // Counter saturated — a wakeup is already pending and
+                // un-drained. The caller's goal (ensure the loop wakes
+                // up) is already achieved. Return true.
+                return true
+            }
+            // EBADF (closed), EINVAL (not eventfd), etc — not delivered.
             return false
         }
     }

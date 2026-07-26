@@ -346,6 +346,40 @@ struct PollTests {
         #expect(n == 1)
         #expect(elapsed < 1.5)  // woke well before the 2s safety timeout
     }
+
+    // MARK: - Edge cases
+
+    @Test("Waker.wake returns true on EAGAIN (counter saturated)")
+    func wakerEagainReturnsTrue() throws {
+        let p = try Poll()
+        let waker = try Waker(registry: p.registry, token: Token(42))
+        // No defer close — Waker.deinit owns the fd.
+
+        // Fill the eventfd counter to saturation (UINT64_MAX - 1).
+        // A single write of that value fills it in one syscall.
+        var fill: UInt64 = UInt64.max - 1
+        let written = withUnsafePointer(to: &fill) { ptr -> Int in
+            Glibc.write(waker.fd, ptr, 8)
+        }
+        #expect(written == 8, "should be able to fill the counter")
+
+        // Now any additional wake() must return true — the wakeup is
+        // functionally delivered (counter is already full, the loop
+        // will observe readiness on the next poll).
+        #expect(waker.wake(), "wake() on saturated counter must return true")
+    }
+
+    @Test("pollNano delivers actual events (not just timeout)")
+    func pollNanoWithEvents() throws {
+        let p = try Poll()
+        let waker = try Waker(registry: p.registry, token: Token(7))
+        #expect(waker.wake())
+
+        var ev = Events(capacity: 4)
+        let n = try ev.waitNano(on: p, timeout: .nanoseconds(0, 100_000_000))
+        #expect(n == 1)
+        ev.forEach { #expect($0.token == Token(7)) }
+    }
 }
 
 // MARK: - Test-only helpers
