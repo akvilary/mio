@@ -16,6 +16,7 @@
 #include "CMIO.h"
 #include <sys/eventfd.h>
 #include <sys/epoll.h>
+#include <sys/timerfd.h>
 #include <stddef.h>
 #include <errno.h>
 
@@ -77,6 +78,20 @@ int sl_epoll_pwait2(
 int sl_eventfd(unsigned int initval, int flags) {
     int fd = eventfd(initval, flags);
     return fd < 0 ? -errno : fd;
+}
+
+int sl_timerfd_create(void) {
+    int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    return fd < 0 ? -errno : fd;
+}
+
+int sl_timerfd_settime(int fd, long interval_sec, long interval_nsec) {
+    struct itimerspec ts;
+    ts.it_interval.tv_sec  = (time_t)interval_sec;
+    ts.it_interval.tv_nsec = (long)interval_nsec;
+    ts.it_value.tv_sec     = (time_t)interval_sec;
+    ts.it_value.tv_nsec    = (long)interval_nsec;
+    return timerfd_settime(fd, 0, &ts, NULL) < 0 ? -errno : 0;
 }
 
 #endif /* __linux__ */

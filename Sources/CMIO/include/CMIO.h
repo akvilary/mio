@@ -86,6 +86,22 @@ int sl_epoll_pwait2(
 /// success, -errno on failure (consistent with the epoll wrappers).
 int sl_eventfd(unsigned int initval, int flags);
 
+// ─── timerfd wrappers ──────────────────────────────────────────────────
+//
+// Swift's Glibc module does not expose <sys/timerfd.h>. Used by the
+// reactor (PollEventLoop) to drive read/write timeouts: a single
+// periodic timerfd per loop wakes it to sweep expired deadlines.
+
+/// Create a monotonic timerfd (CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC).
+/// Wrapper around timerfd_create(2). Returns fd >= 0, or -errno on failure.
+int sl_timerfd_create(void);
+
+/// Arm `fd` as a PERIODIC timer that first expires after one `interval`
+/// and then repeats every `interval`. Wrapper around timerfd_settime(2)
+/// with it_value = it_interval = interval. Returns 0 on success, -errno
+/// on failure. Pass interval_sec=0 && interval_nsec=0 to disarm.
+int sl_timerfd_settime(int fd, long interval_sec, long interval_nsec);
+
 #ifdef __cplusplus
 }
 #endif
