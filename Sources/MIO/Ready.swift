@@ -32,28 +32,42 @@ public struct Ready: OptionSet, Sendable, Hashable, CustomStringConvertible {
     public static let hangup       = Ready(rawValue: 0x010)  // EPOLLHUP
     public static let readHangup   = Ready(rawValue: 0x2000) // EPOLLRDHUP
 
-    /// Convenience: read-side EOF (`hangup` without `readable`, or
-    /// `readHangup`). Mirrors mio's `is_read_closed`.
+    /// Read-side EOF. Mirrors mio's `is_read_closed` on epoll exactly:
+    ///
+    ///   - `hangup` — both halves of the peer closed, or
+    ///   - `readable && readHangup` — FIN received (possibly with
+    ///     unread data still buffered) or `shutdown(SHUT_RD)`.
+    ///
+    /// `readHangup` is only ever reported because `Registry.register`
+    /// adds `EPOLLRDHUP` to `.readable` registrations (mio parity).
     @inlinable
     public var isReadClosed: Bool {
-        // EPOLLHUP alone (no EPOLLIN) ⇒ peer closed.
-        // EPOLLRDHUP ⇒ peer closed the write side.
-        let r = self.rawValue
-        return (r & Ready.readHangup.rawValue != 0)
-            || (r & Ready.hangup.rawValue != 0 && r & Ready.readable.rawValue == 0)
+        isHangup || (contains(.readable) && contains(.readHangup))
     }
 
-    /// Convenience: write-side EOF (`hangup` without `writable`, or
-    /// `error`). Mirrors mio's `is_write_closed`.
+    /// Write-side EOF. Mirrors mio's `is_write_closed` on epoll exactly:
+    ///
+    ///   - `hangup` — both halves closed, or
+    ///   - `writable && error` — Unix pipe read end closed, or
+    ///   - the event mask is *exactly* `error` (nothing but EPOLLERR —
+    ///     the other side of a Unix pipe has closed).
+    ///
+    /// Note: the local side shutting down its write half does NOT
+    /// trigger this on epoll (same as mio).
     @inlinable
     public var isWriteClosed: Bool {
-        let r = self.rawValue
-        return (r & Ready.hangup.rawValue != 0 && r & Ready.writable.rawValue == 0)
-            || (r & Ready.error.rawValue != 0)
+        isHangup
+            || (contains(.writable) && isError)
+            || rawValue == Ready.error.rawValue
     }
 
+    /// Readable, including out-of-band/priority data. Mirrors mio's
+    /// `is_readable` on epoll: `EPOLLIN || EPOLLPRI`. Folding OOB into
+    /// readable is deliberate (see the DoS note in mio's docs): apps
+    /// that never read OOB data would otherwise sit on a permanently
+    /// ready source.
     @inlinable
-    public var isReadable: Bool   { contains(.readable) }
+    public var isReadable: Bool   { contains(.readable) || contains(.priority) }
     @inlinable
     public var isWritable: Bool   { contains(.writable) }
     @inlinable

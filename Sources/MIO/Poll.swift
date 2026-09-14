@@ -3,15 +3,17 @@
 //  Poll.swift / Registry.swift
 //  MIO
 //
-//  Low-level mio analog. `Poll` owns the epoll fd; `Registry` is a
-//  shareable handle exposing only the registration surface. Mirrors
-//  `mio::{Poll, Registry}` (rust).
+//  Low-level mio analog. `Registry` is the ARC-shared owner of the epoll
+//  fd; `Poll` is a lightweight value wrapping it. Mirrors
+//  `mio::{Poll, Registry}` (rust) with ownership adapted to ARC: where
+//  mio keeps its selector alive across `Registry::try_clone` via
+//  `OwnedFd`/`dup(2)`, here reference counting does the same job with
+//  no extra allocation or syscall.
 //
 //===----------------------------------------------------------------------===//
 
 #if os(Linux)
 
-import Foundation
 import CMIO
 import Synchronization
 
@@ -43,6 +45,7 @@ public struct PollTimeout: Sendable, Hashable {
         public let nsec: Int32
 
         @inlinable public init(sec: Int64, nsec: Int32 = 0) {
+            precondition(nsec >= 0 && nsec < 1_000_000_000, "nsec out of range")
             self.sec = sec
             self.nsec = nsec
         }
@@ -110,37 +113,38 @@ public struct PollTimeout: Sendable, Hashable {
 
 /// Top-level epoll handle.
 ///
-/// A `Poll` owns a single epoll fd (created via `epoll_create1` with
-/// `EPOLL_CLOEXEC`). Sources are registered through `registry`; events
-/// are awaited through `poll`.
+/// A `Poll` wraps the ARC-shared `Registry` that owns the epoll fd
+/// (created via `epoll_create1` with `EPOLL_CLOEXEC`). Sources are
+/// registered through `registry`; events are awaited through `poll`.
 ///
-/// Threading model: the `Poll`/`Registry` pair is `Sendable`. `Registry`
-/// may be cloned freely and used from any thread. The same epoll fd may
-/// be concurrently read via `poll` (from one thread) and modified via
-/// `register`/`reregister`/`deregister` (from any thread) — this is
+/// Threading model: `Poll` and `Registry` are `Sendable`. `Registry`
+/// may be shared freely and used from any thread. The same epoll fd may
+/// be concurrently waited on via `poll` (from one thread) and modified
+/// via `register`/`reregister`/`deregister` (from any thread) — this is
 /// explicitly permitted by epoll(7). The realistic pattern is one
 /// thread per `Poll`, with cross-thread registration as needed.
+/// `Sendable` is satisfied structurally: `Poll`'s only stored property
+/// is a `let` reference to the `Registry` class, which itself stores an
+/// immutable fd and relies on kernel-side epoll synchronisation.
 ///
-/// `Sendable` is satisfied structurally: both stored properties are
-/// immutable (`let`) and themselves `Sendable`. The class performs no
-/// shared mutable state of its own — `epoll_ctl` and `epoll_wait` are
-/// thread-safe in the kernel.
-///
-/// **Lifetime contract:** `Poll` owns the epoll fd and closes it in
-/// `deinit`. `Registry` is a lightweight handle that does NOT keep
-/// `Poll` alive — it stores only the raw fd integer. The caller MUST
-/// keep `Poll` alive as long as any `Registry` or `Waker` is in use;
-/// otherwise `epoll_ctl`/`epoll_wait` calls on the closed fd will
-/// return `EBADF`. In Rust's mio this is enforced by the borrow checker
-/// (`Registry` borrows `Poll`); in Swift it is a runtime contract.
-public final class Poll: Sendable {
+/// **Ownership (ARC adaptation of mio):** `Poll` is a value (struct);
+/// the epoll fd lives as long as the **last** reference to `registry`.
+/// Dropping the `Poll` value itself does not close the fd — any stored
+/// `Registry` keeps the epoll instance alive, and when the final
+/// reference is released, `Registry.deinit` closes the fd (the kernel
+/// then drops all registrations atomically). There is no EBADF
+/// lifetime contract to uphold. This mirrors mio's `OwnedFd` semantics
+/// — Rust's mio achieves the same via `Registry::try_clone` + `dup(2)`;
+/// ARC gives it to us for free, with one allocation instead of two.
+public struct Poll: Sendable {
 
-    /// Raw epoll fd. Used by integration tests; production code should
-    /// go through `Registry`.
-    public let epfd: CInt
-
-    /// The registry associated with this poll instance.
+    /// The registry associated with this poll instance. Retaining it
+    /// keeps the epoll fd alive.
     public let registry: Registry
+
+    /// Raw epoll fd. Diagnostic accessor used by integration tests;
+    /// production code should go through `Registry`.
+    public var epfd: CInt { registry._epfd }
 
     /// Process-wide cache: `true` once `epoll_pwait2` has returned
     /// `ENOSYS` (kernel < 5.11) on any `Poll` instance. Subsequent
@@ -151,24 +155,7 @@ public final class Poll: Sendable {
     internal static let pwait2Unavailable = Atomic<Bool>(false)
 
     public init() throws {
-        let fd = sl_epoll_create1()
-        // sl_epoll_create1 returns either a non-negative fd on success
-        // or `-errno` on failure — race-free errno capture at the C
-        // layer (the C function captures errno before any subsequent
-        // syscall can clobber it).
-        guard fd >= 0 else {
-            throw PollError(code: Int32(-fd), function: "epoll_create1")
-        }
-        self.epfd = fd
-        self.registry = Registry(epfd: fd)
-    }
-
-    deinit {
-        // `epfd` is a `let` assigned only after a successful `init`;
-        // any throwing init path leaves no `Poll` instance to deinit.
-        // The guard is therefore unreachable in correct usage but kept
-        // defensive against future reinit paths.
-        if epfd >= 0 { _ = Glibc.close(epfd) }
+        self.registry = try Registry()
     }
 
     /// Wait for registered sources to become ready and write up to
@@ -221,17 +208,44 @@ public final class Poll: Sendable {
     }
 }
 
-/// A handle to a `Poll` exposing only source registration.
+/// The ARC-shared owner of an epoll fd, exposing only the source
+/// registration surface.
 ///
-/// `Registry` is `Equatable` (two registries are equal iff they reference
-/// the same underlying epoll fd) and `Hashable`. It may be shared across
-/// threads. `Sendable` is structural: the only stored property is an
-/// immutable fd, and `epoll_ctl(2)` is thread-safe.
+/// `Registry` is a reference type on purpose: sharing it across threads
+/// (storing it in event loops, connection drivers, worker contexts) is
+/// how the epoll fd's lifetime is extended — ARC plays the role mio
+/// gives to `OwnedFd` + `dup(2)`. The fd is closed in `deinit`, i.e.
+/// when the last reference is released.
+///
+/// It is `Equatable`/`Hashable` by **identity** (same object), never by
+/// the raw fd number: once an fd is closed the kernel may recycle its
+/// number for an unrelated file, so fd-number equality would
+/// misidentify distinct registries. Two registries are equal iff they
+/// reference the same epoll instance — obtainable only via
+/// `poll.registry` from the same `Poll`.
 public final class Registry: Sendable, Hashable {
     @usableFromInline internal let _epfd: CInt
 
-    @usableFromInline internal init(epfd: CInt) {
-        self._epfd = epfd
+    /// Creates the epoll fd (`epoll_create1` + `EPOLL_CLOEXEC`).
+    /// Internal: obtain a `Registry` from `Poll.registry`, mirroring
+    /// mio where `Registry` is only handed out by `Poll`.
+    internal init() throws {
+        let fd = sl_epoll_create1()
+        // sl_epoll_create1 returns either a non-negative fd on success
+        // or `-errno` on failure — race-free errno capture at the C
+        // layer (the C function captures errno before any subsequent
+        // syscall can clobber it).
+        guard fd >= 0 else {
+            throw PollError(code: Int32(-fd), function: "epoll_create1")
+        }
+        self._epfd = fd
+    }
+
+    deinit {
+        // The single owner: runs when the last reference (from `Poll`,
+        // a stored `Registry`, etc.) is released. Closing the epoll fd
+        // atomically removes every registration kernel-side.
+        _ = Glibc.close(_epfd)
     }
 
     /// Register `fd` for notifications described by `interest`, tagging
@@ -242,6 +256,10 @@ public final class Registry: Sendable, Hashable {
     /// (`EEXIST` is raised as `PollError`). The fd must be a valid kernel
     /// file descriptor — `epoll_ctl(2)` rejects fds referring to a
     /// different epoll instance, but accepts any non-epoll fd.
+    ///
+    /// Mirroring mio's `interests_to_epoll`, `EPOLLRDHUP` is added
+    /// automatically to `.readable` registrations so peer half-close is
+    /// observable in delivered events (`Event.isReadClosed`).
     public func register(
         fd: CInt, token: Token, interest: Interest
     ) throws {
@@ -251,7 +269,7 @@ public final class Registry: Sendable, Hashable {
         // is no release-cost.
         assert(!(interest.isExclusive && interest.isEdge),
             "EPOLLEXCLUSIVE may not be combined with EPOLLET (kernel ABI)")
-        let rc = sl_epoll_ctl_add(_epfd, fd, interest.rawValue, token.raw)
+        let rc = sl_epoll_ctl_add(_epfd, fd, interest._epollBits, token.raw)
         if rc != 0 {
             throw PollError(code: Int32(-rc), function: "epoll_ctl(ADD)")
         }
@@ -263,7 +281,7 @@ public final class Registry: Sendable, Hashable {
     public func reregister(
         fd: CInt, token: Token, interest: Interest
     ) throws {
-        let rc = sl_epoll_ctl_mod(_epfd, fd, interest.rawValue, token.raw)
+        let rc = sl_epoll_ctl_mod(_epfd, fd, interest._epollBits, token.raw)
         if rc != 0 {
             throw PollError(code: Int32(-rc), function: "epoll_ctl(MOD)")
         }
@@ -284,6 +302,10 @@ public final class Registry: Sendable, Hashable {
     /// registered). Any other error (e.g. `EBADF`) is still surfaced via
     /// `throw`. Useful in cleanup/deinit paths where the fd may already
     /// have been removed or recycled.
+    ///
+    /// Note: for fds you own and are about to `close(2)`, an explicit
+    /// deregister is redundant — closing an fd removes it from every
+    /// epoll interest list atomically.
     @discardableResult
     public func tryDeregister(fd: CInt) throws -> Bool {
         let rc = sl_epoll_ctl_del(_epfd, fd)
@@ -293,14 +315,14 @@ public final class Registry: Sendable, Hashable {
         throw PollError(code: err, function: "epoll_ctl(DEL)")
     }
 
-    // ── Hashable / Equatable — by underlying epfd ──────────────────────
+    // ── Hashable / Equatable — by object identity ─────────────────────
 
     public static func == (lhs: Registry, rhs: Registry) -> Bool {
-        lhs._epfd == rhs._epfd
+        lhs === rhs
     }
 
     public func hash(into hasher: inout Hasher) {
-        hasher.combine(_epfd)
+        hasher.combine(ObjectIdentifier(self))
     }
 }
 

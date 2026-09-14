@@ -63,9 +63,12 @@ int sl_epoll_wait(int epfd, sl_epoll_event *events, int maxevents, int timeout);
 
 /// Block waiting for events with nanosecond-resolution timeout. Wrapper
 /// around epoll_pwait2(2) (Linux 5.11+). `timeout_sec`/`timeout_nsec`
-/// follow `struct timespec` conventions: negative `tv_sec` means block
-/// forever, 0/0 means non-blocking poll. The signal mask (`sigmask`,
-/// may be NULL) is atomically installed for the duration of the wait.
+/// follow `struct timespec` conventions: a NEGATIVE `timeout_sec` means
+/// block forever (implemented by passing a NULL timespec pointer, which
+/// is the only form epoll_pwait2 accepts for an indefinite wait — a
+/// negative `tv_sec` struct would fail with EINVAL), 0/0 means
+/// non-blocking poll. The signal mask (`sigmask`, may be NULL) is
+/// atomically installed for the duration of the wait.
 ///
 /// Returns the number of events, 0 on timeout, or -errno on failure.
 /// -ENOSYS is reported on kernels < 5.11; callers should fall back to

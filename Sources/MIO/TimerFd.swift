@@ -16,7 +16,6 @@
 
 #if os(Linux)
 
-import Foundation
 import CMIO
 
 #if canImport(Glibc)

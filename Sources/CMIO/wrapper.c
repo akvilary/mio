@@ -57,14 +57,22 @@ int sl_epoll_pwait2(
     const void *sigmask,
     unsigned long sigsetsize
 ) {
+    // A negative timeout_sec means "block indefinitely". epoll_pwait2
+    // requires a NULL timespec pointer for that: a timespec with a
+    // negative tv_sec is rejected with EINVAL (timespec64_valid), and
+    // 0/0 would mean "return immediately" instead.
     struct timespec ts;
-    ts.tv_sec  = (time_t)timeout_sec;
-    ts.tv_nsec = (long)timeout_nsec;
+    const struct timespec *ts_ptr = NULL;
+    if (timeout_sec >= 0) {
+        ts.tv_sec  = (time_t)timeout_sec;
+        ts.tv_nsec = (long)timeout_nsec;
+        ts_ptr = &ts;
+    }
     int n = epoll_pwait2(
         epfd,
         (struct epoll_event *)events,
         maxevents,
-        &ts,
+        ts_ptr,
         (const sigset_t *)sigmask
     );
     // Note: `sigsetsize` is accepted by the underlying syscall but glibc's

@@ -5,14 +5,13 @@
 //
 //  Cross-thread wakeup primitive. Mirrors `mio::Waker` (rust). On Linux
 //  it is implemented as an eventfd registered with EPOLLIN on the
-//  target Poll; `wake()` writes 8 bytes (one wakeup), the loop observes
-//  a readable event on the waker's token and drains the counter.
+//  target Registry; `wake()` writes 8 bytes (one wakeup), the loop
+//  observes a readable event on the waker's token and drains the counter.
 //
 //===----------------------------------------------------------------------===//
 
 #if os(Linux)
 
-import Foundation
 import CMIO
 
 #if canImport(Glibc)
@@ -21,44 +20,50 @@ import Glibc
 
 /// Cross-thread wakeup primitive.
 ///
-/// A `Waker` is bound to a specific `(Registry, Token)` pair. Calling
-/// `wake()` from any thread causes that token to appear as readable on
-/// the next `Poll.poll`. The loop is responsible for draining the
-/// counter via `reset()` (or simply by reading 8 bytes) before waiting
+/// A `Waker` is bound to a specific `(Registry, Token)` pair at creation
+/// time. Calling `wake()` from any thread causes that token to appear as
+/// readable on the next `Poll.poll`. The loop is responsible for draining
+/// the counter via `reset()` (or simply by reading 8 bytes) before waiting
 /// again — otherwise level-triggered epoll will keep firing the event.
 ///
-/// `Waker` is `Sendable` (structurally — all stored properties are
-/// immutable `let`s of `Sendable` types) and safe to share across
-/// threads. Multiple wakers may share the same token (wakeup coalescing
-/// is the kernel's responsibility: eventfd's counter saturates at
-/// `UINT64_MAX - 1` and a write into a full counter fails with
-/// `EAGAIN`).
+/// `Waker` is a **class** deliberately: its purpose is cross-thread
+/// sharing, which is exactly what ARC references provide (Rust callers
+/// wrap mio's `Waker` in an `Arc` for the same effect — see mio's own
+/// `waker.rs` example). All stored properties are immutable `let`s of
+/// `Sendable` types, so `Sendable` is satisfied structurally. Multiple
+/// wakers may share the same token (wakeup coalescing is the kernel's
+/// responsibility: eventfd's counter saturates at `UINT64_MAX - 1` and a
+/// write into a full counter fails with `EAGAIN`).
 ///
-/// **Lifetime contract:** the caller MUST keep the `Waker` alive while
-/// `wake()` may be called from another thread. If the last reference is
-/// dropped while a `wake()` is in flight, `deinit`'s `close(fd)` races
-/// with `write(fd, ...)`. In practice the event loop owns the `Waker`
-/// for the entire lifetime of any Task that may call `wake()`, so this
-/// is satisfied automatically.
+/// **Lifetime:**
+///   - The waker owns its eventfd and closes it in `deinit`. Callers
+///     MUST NOT `close(2)` it manually — doing so causes a double-close
+///     (silent at best, an fd-recycling misattribution at worst).
+///   - The caller MUST keep the `Waker` alive while `wake()` may be
+///     called from another thread. If the last reference is dropped
+///     while a `wake()` is in flight, `deinit`'s `close(fd)` races with
+///     `write(fd, ...)`. In practice the event loop owns the `Waker`
+///     for the entire lifetime of any Task that may call `wake()`, so
+///     this is satisfied automatically.
+///   - The `Waker` does **not** keep the `Registry`'s epoll fd alive
+///     (matching mio, where `Waker` does not hold the selector): if
+///     every `Poll`/`Registry` reference is released, the epoll
+///     instance closes and pending wakeups are simply unobserved.
+///     `wake()` itself remains harmless — it writes to the still-open
+///     eventfd counter.
 public final class Waker: Sendable {
 
     /// The raw eventfd. Read-only diagnostic accessor.
-    ///
-    /// `Waker` owns the fd and closes it in `deinit`. Callers MUST NOT
-    /// `close(2)` it manually — doing so causes a double-close (silent
-    /// at best, an fd-recycling misattribution at worst: the kernel may
-    /// have already handed this number to an unrelated `socket()`).
     public let fd: CInt
 
     /// The token this waker raises when fired.
     public let token: Token
 
-    private let registry: Registry
-
     /// Create a new waker registered for `token` on `registry`.
     ///
-    /// The waker is registered with `Interest.readable` (level-triggered).
-    /// The caller MUST NOT also register `fd` for any other token.
+    /// The waker is registered with `Interest.readable` (level-triggered;
+    /// `EPOLLRDHUP` is added automatically but an eventfd never reports
+    /// it). The caller MUST NOT also register `fd` for any other token.
     public init(registry: Registry, token: Token) throws {
         // EFD_NONBLOCK | EFD_CLOEXEC. EFD_SEMAPHORE is NOT used — we want
         // 64-bit counter semantics so N wakeups don't require N reads.
@@ -68,21 +73,20 @@ public final class Waker: Sendable {
         guard fd >= 0 else {
             throw PollError.fromNegativeReturn(fd, function: "eventfd")
         }
-        self.fd = fd
-        self.token = token
-        self.registry = registry
         do {
             try registry.register(fd: fd, token: token, interest: .readable)
         } catch {
             _ = Glibc.close(fd)
             throw error
         }
+        self.fd = fd
+        self.token = token
     }
 
     deinit {
-        // Best-effort deregister — `ENOENT` (fd already removed by the
-        // caller) is silently ignored. Then close the eventfd.
-        _ = try? registry.tryDeregister(fd: fd)
+        // close(2) atomically removes the fd from every epoll interest
+        // list that references it — no explicit EPOLL_CTL_DEL needed
+        // (mio relies on the same kernel behaviour).
         _ = Glibc.close(fd)
     }
 
@@ -95,8 +99,8 @@ public final class Waker: Sendable {
     /// `true`.
     ///
     /// `EINTR` (signal interrupted the syscall before any bytes were
-    /// written) is retried automatically, matching mio's behaviour.
-    /// `EBADF` (fd closed) or `EINVAL` (fd not eventfd) return `false`.
+    /// written) is retried automatically. `EBADF` (fd closed) or
+    /// `EINVAL` (fd not eventfd) return `false`.
     @discardableResult
     public func wake() -> Bool {
         var val: UInt64 = 1

@@ -41,7 +41,9 @@ public struct Interest: OptionSet, Sendable, Hashable, CustomStringConvertible {
     // These map 1:1 onto the kernel's EPOLL constants and must not be
     // renumbered.
 
-    /// Notify when the source is readable (`EPOLLIN`).
+    /// Notify when the source is readable (`EPOLLIN`). `EPOLLRDHUP` is
+    /// added automatically at registration time (see `_epollBits`), so
+    /// peer half-close surfaces via `Event.isReadClosed`.
     public static let readable = Interest(rawValue: 0x001)
 
     /// Notify when the source is writable (`EPOLLOUT`).
@@ -72,6 +74,10 @@ public struct Interest: OptionSet, Sendable, Hashable, CustomStringConvertible {
     ///   - May NOT be set via `reregister` — must be present at the
     ///     initial `register` call (the kernel silently ignores later
     ///     attempts to add it).
+    ///   - The kernel whitelist for `EPOLLEXCLUSIVE` is exactly
+    ///     `EPOLLIN | EPOLLOUT`: the auto-added `EPOLLRDHUP` is
+    ///     suppressed for `.exclusive` registrations, so
+    ///     `Event.isReadClosed` will not fire for them.
     ///   - For `accept(2)`-style events only — semantics with `read`/
     ///     `write` are not what most callers expect (events may still
     ///     queue if the same fd is registered multiple times).
@@ -82,9 +88,35 @@ public struct Interest: OptionSet, Sendable, Hashable, CustomStringConvertible {
     /// Both readable and writable. Convenience for `[.readable, .writable]`.
     public static let both: Interest = [.readable, .writable]
 
-    /// Mask of the two readiness bits. Useful when stripping modifier bits
+    /// Mask of the readiness bits. Useful when stripping modifier bits
     /// before comparing or persisting.
     public static let readinessMask: Interest = [.readable, .writable, .priority]
+
+    // ── Kernel mapping ─────────────────────────────────────────────────
+
+    /// Raw epoll `events` bits used when registering this interest.
+    ///
+    /// Mirrors mio's `interests_to_epoll`: `EPOLLRDHUP` rides along with
+    /// `EPOLLIN` so peer half-close is observable in delivered events
+    /// (`Event.isReadClosed`). Without it the kernel never reports the
+    /// RDHUP bit and half-close is indistinguishable from ordinary
+    /// readability.
+    ///
+    /// Exception: `.exclusive` registrations. The kernel's
+    /// `EPOLLEXCLUSIVE` whitelist is exactly `EPOLLIN | EPOLLOUT` —
+    /// adding `EPOLLRDHUP` fails the whole `epoll_ctl` with `EINVAL`
+    /// (verified on Linux 6.17; the restriction has existed since the
+    /// flag's introduction in 4.5). Half-close detection is therefore
+    /// unavailable for shared-listener registrations — acceptable
+    /// because accept-ready listeners are closed wholesale, not
+    /// half-closed.
+    internal var _epollBits: UInt32 {
+        var bits = rawValue
+        if contains(.readable) && !contains(.exclusive) {
+            bits |= Ready.readHangup.rawValue // EPOLLRDHUP (0x2000)
+        }
+        return bits
+    }
 
     @inlinable
     public var isReadable: Bool { contains(.readable) }

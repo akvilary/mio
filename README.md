@@ -2,9 +2,10 @@
 
 A Swift port of [**mio** (Rust)](https://github.com/tokio-rs/mio): lightweight,
 portable, readiness-based I/O primitives backed by `epoll` on Linux. The public
-surface mirrors mio 1:1 — `Poll`, `Registry`, `Token`, `Interest`, `Ready`,
+surface mirrors mio's — `Poll`, `Registry`, `Token`, `Interest`, `Ready`,
 `Event`, `Events`, `Waker`, `event::Source` — so the mental model (and most of
-the documentation) transfers directly.
+the documentation) transfers directly. Deliberate divergences are listed
+[below](#divergences-from-rust-mio).
 
 > **What this is — and isn't.** MIO is **only** the low-level readiness layer.
 > It does **not** include an event loop, executor, async runtime, or buffered
@@ -98,16 +99,55 @@ try registry.register(
 )
 ```
 
-### Swift 6.2 concurrency model
+### Swift 6.2 concurrency and ownership model
 
-`Poll`, `Registry`, and `Waker` are `Sendable` **structurally** — their
-stored state is immutable and they perform no shared mutable Swift-level
-operations (kernel-side epoll is internally synchronised). The compiler
-verifies this without `@unchecked`.
+`Poll` is a **struct** wrapping a `Registry`; `Registry` is the ARC-shared
+**owner** of the epoll fd. The fd is closed when the *last* reference to the
+registry is released — dropping the `Poll` value itself does not close
+anything. Storing a `Registry` anywhere (an event loop, a connection driver,
+a worker context) keeps the epoll instance alive; there is no "keep `Poll`
+alive" runtime contract. This is the ARC analogue of mio's `OwnedFd`
+selector lifetime — Rust mio achieves it with `Registry::try_clone` +
+`dup(2)`; here reference counting does it with one allocation and no extra
+syscall. `Registry` is `Sendable` structurally, and `Equatable`/`Hashable`
+by object identity (never by fd number, which the kernel recycles).
 
 `Events` is **intentionally non-`Sendable`**: its `_count` field is mutated
 by `Poll.poll` on the calling thread, and sharing it across threads would
 race by design. Use one `Events` per worker thread.
+
+`Waker` is a class **on purpose**: its role is cross-thread sharing, which
+is exactly what ARC references provide (Rust callers wrap mio's `Waker` in
+an `Arc` for the same effect).
+
+## Divergences from Rust mio
+
+Deliberate (documented in-source as well):
+
+- **Level-triggered by default.** mio registers everything edge-triggered
+  (`EPOLLET` is added unconditionally) and pushes the
+  drain-until-`EAGAIN` discipline onto callers. MIO-Swift defaults to
+  level-triggered — safer for hand-rolled loops — with per-registration
+  opt-in via `.edge`.
+- **`EPOLLRDHUP` is added automatically** to `.readable` registrations,
+  matching mio, so peer half-close is observable via `event.isReadClosed`
+  (suppressed for `.exclusive`, whose kernel whitelist is exactly
+  `EPOLLIN | EPOLLOUT`).
+- **`EINTR` is retried internally** by `poll`/`wake` instead of surfacing
+  an interrupted error (mio 1.x returns `Interrupted` to the caller). The
+  retry restarts with the full timeout — deadline-sensitive callers should
+  use `.immediate` plus their own clock.
+- **Nanosecond timeouts** via `epoll_pwait2` (Linux 5.11+) with an
+  `ENOSYS` fallback to `epoll_wait` — mio only offers millisecond
+  resolution.
+- **`.oneshot` / `.exclusive` registration modifiers** are exposed
+  (`EPOLLONESHOT`, `EPOLLEXCLUSIVE`); mio does not expose them.
+- **`Waker.wake()` returns `Bool`** and treats `EAGAIN` on a saturated
+  counter as delivered; mio's `wake()` returns `io::Result<()>` and
+  resets+retries on `WouldBlock`. The waker is registered
+  level-triggered, so the caller drains it via `reset()`.
+- **`TimerFd`** — a timerfd-backed periodic timer — is included as a
+  convenience for reactors; it is not part of mio's surface.
 
 ## Why?
 

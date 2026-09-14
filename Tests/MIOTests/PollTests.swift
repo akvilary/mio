@@ -380,6 +380,123 @@ struct PollTests {
         #expect(n == 1)
         ev.forEach { #expect($0.token == Token(7)) }
     }
+
+    // MARK: - Ownership (ARC)
+
+    @Test("Registry keeps the epoll fd alive after the Poll value is gone")
+    func registryOwnsEpfdLifetime() throws {
+        var kept: Registry? = nil
+        do {
+            let p = try Poll()
+            kept = p.registry
+        }
+        // The `Poll` value is out of scope; the stored Registry reference
+        // must keep the epoll fd alive (ARC plays the role mio gives to
+        // OwnedFd + dup(2)). These would fail with EBADF otherwise.
+        guard let registry = kept else {
+            Issue.record("registry not retained")
+            return
+        }
+        guard let sp = makeSocketpair() else { Issue.record("socketpair failed"); return }
+        defer { _ = Glibc.close(sp.read); _ = Glibc.close(sp.write) }
+
+        try registry.register(fd: sp.read, token: Token(31), interest: .readable)
+        try registry.reregister(fd: sp.read, token: Token(32), interest: .readable)
+        #expect(try registry.tryDeregister(fd: sp.read) == true)
+    }
+
+    @Test("Registry equality is identity-based, not fd-based")
+    func registryIdentityEquality() throws {
+        let p1 = try Poll()
+        let p2 = try Poll()
+        let r1 = p1.registry
+        #expect(r1 == p1.registry)
+        #expect(r1 != p2.registry)
+        var h1 = Hasher(); r1.hash(into: &h1)
+        var h2 = Hasher(); r1.hash(into: &h2)
+        #expect(h1.finalize() == h2.finalize())
+    }
+
+    // MARK: - mio-parity readiness semantics
+
+    @Test("Half-close is observable: readable + readClosed (auto EPOLLRDHUP)")
+    func halfCloseIsReadClosed() throws {
+        let p = try Poll()
+        guard let sp = makeSocketpair() else { Issue.record("socketpair failed"); return }
+        let (r, w) = (sp.read, sp.write)
+        defer { _ = Glibc.close(r); _ = Glibc.close(w) }
+
+        try p.registry.register(fd: r, token: Token(21), interest: .readable)
+
+        var byte: UInt8 = 1
+        #expect(Glibc.write(w, &byte, 1) == 1)
+        #expect(Glibc.shutdown(w, Int32(SHUT_WR)) == 0)
+
+        var ev = Events(capacity: 4)
+        #expect(try ev.wait(on: p, timeout: .immediate) == 1)
+        ev.forEach { e in
+            #expect(e.token == Token(21))
+            #expect(e.isReadable)      // one byte is buffered
+            #expect(e.isReadClosed)    // IN|RDHUP — mio parity
+            #expect(!e.isHangup)       // half-close, not a full HUP
+        }
+    }
+
+    @Test("Ready predicates match mio formulas")
+    func readyPredicateParity() throws {
+        // IN|RDHUP (data + FIN): readable AND read-closed.
+        let r1 = Ready(rawValue: 0x2001)
+        #expect(r1.isReadable)
+        #expect(r1.isReadClosed)
+        #expect(!r1.isHangup)
+
+        // PRI only: readable per mio (OOB folded into readable).
+        let r2 = Ready(rawValue: 0x002)
+        #expect(r2.isReadable)
+
+        // OUT|ERR (pipe read end closed): write-closed.
+        let r3 = Ready(rawValue: 0x004 | 0x008)
+        #expect(r3.isWriteClosed)
+
+        // Exactly ERR: write-closed per mio's `events == EPOLLERR` case.
+        let r4 = Ready(rawValue: 0x008)
+        #expect(r4.isWriteClosed)
+        #expect(!r4.isWritable)
+    }
+
+    @Test("waitNano with .blocking blocks until a source is ready (no EINVAL)")
+    func waitNanoBlockingWithWaker() throws {
+        let p = try Poll()
+        let waker = try Waker(registry: p.registry, token: Token(3))
+        // Pre-fire so the wait returns immediately. Before the
+        // NULL-timespec fix this threw PollError(EINVAL) from
+        // epoll_pwait2 (a negative tv_sec is rejected by the kernel).
+        #expect(waker.wake())
+
+        var ev = Events(capacity: 4)
+        let n = try ev.waitNano(on: p, timeout: .blocking)
+        #expect(n == 1)
+        ev.forEach { #expect($0.token == Token(3)) }
+        _ = waker.reset()
+    }
+
+    @Test("EPOLLEXCLUSIVE registration accepts .readable (RDHUP suppressed by kernel whitelist)")
+    func exclusiveRegistration() throws {
+        let p = try Poll()
+        guard let sp = makeSocketpair() else { Issue.record("socketpair failed"); return }
+        let (r, w) = (sp.read, sp.write)
+        defer { _ = Glibc.close(r); _ = Glibc.close(w) }
+
+        // The kernel's EPOLLEXCLUSIVE whitelist is exactly EPOLLIN|EPOLLOUT;
+        // _epollBits suppresses the auto-added EPOLLRDHUP for .exclusive.
+        try p.registry.register(fd: r, token: Token(9), interest: [.readable, .exclusive])
+
+        var byte: UInt8 = 1
+        _ = Glibc.write(w, &byte, 1)
+        var ev = Events(capacity: 4)
+        #expect(try ev.wait(on: p, timeout: .immediate) == 1)
+        ev.forEach { #expect($0.token == Token(9)) }
+    }
 }
 
 // MARK: - Test-only helpers
