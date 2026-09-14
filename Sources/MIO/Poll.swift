@@ -77,10 +77,12 @@ public struct PollTimeout: Sendable, Hashable {
     public static let immediate  = PollTimeout(raw: 0)
 
     public static func milliseconds(_ ms: Int) -> PollTimeout {
-        // Clamp to epoll_wait's int range. Negative values are reserved
-        // for "block forever" — anything < -1 is undefined behaviour.
-        let clamped = max(0, CInt(ms))
-        return PollTimeout(raw: clamped)
+        // Clamp to epoll_wait's int range (~24.8 days) instead of
+        // trapping on overflow; negative values collapse to 0
+        // (immediate). Negative timeout values are reserved for "block
+        // forever" and are only expressible via .blocking.
+        let clamped = ms <= 0 ? 0 : min(ms, Int(CInt.max))
+        return PollTimeout(raw: CInt(clamped))
     }
 
     public static func milliseconds(_ ms: CInt) -> PollTimeout {
@@ -92,18 +94,28 @@ public struct PollTimeout: Sendable, Hashable {
     /// millisecond truncation (rounded up to avoid under-shooting).
     ///
     /// `sec` may be negative (block forever); `nsec` must be in `0 ..< 1_000_000_000`.
+    /// Overflow never traps: the millisecond **fallback** saturates at
+    /// `CInt.max` (~24.8 days — the widest timeout `epoll_wait` accepts),
+    /// while the nanosecond component carries the caller's full value —
+    /// on `epoll_pwait2` kernels (`timespec.tv_sec` is 64-bit) huge
+    /// timeouts are honoured exactly.
     public static func nanoseconds(_ sec: Int64, _ nsec: Int32 = 0) -> PollTimeout {
         precondition(nsec >= 0 && nsec < 1_000_000_000, "nsec out of range")
-        // Ceiling-divide into milliseconds for the fallback path so the
-        // caller never waits less than requested when epoll_pwait2 is
-        // unavailable. Swift traps on Int64 overflow, so an absurd
-        // timeout (>292 years) crashes rather than silently wrapping.
-        let totalNs: Int64 = sec >= 0
-            ? sec * 1_000_000_000 + Int64(nsec)
-            : -1
-        let ms: CInt = totalNs < 0
-            ? -1
-            : CInt((totalNs + 999_999) / 1_000_000)
+        let ms: CInt
+        if sec < 0 {
+            ms = -1
+        } else if sec > Int64(CInt.max) / 1_000 + 1 {
+            // Beyond the ms range *and* beyond what sec*1e9 could hold
+            // without overflowing Int64 — saturate rather than trap.
+            ms = CInt.max
+        } else {
+            // Ceiling-divide into milliseconds for the fallback path so
+            // the caller never waits less than requested when
+            // epoll_pwait2 is unavailable. `sec` is bounded above, so
+            // the product cannot overflow.
+            let totalNs = sec * 1_000_000_000 + Int64(nsec)
+            ms = CInt(min((totalNs + 999_999) / 1_000_000, Int64(CInt.max)))
+        }
         return PollTimeout(
             milliseconds: ms,
             nanoseconds: Nanoseconds(sec: sec, nsec: nsec)
@@ -226,6 +238,21 @@ public struct Poll: Sendable {
 public final class Registry: Sendable, Hashable {
     @usableFromInline internal let _epfd: CInt
 
+    #if DEBUG
+    /// Debug-only diagnostic mirroring mio's `Registry::register_waker`:
+    /// at most one Waker per registry. Multiple wakers sharing a token
+    /// defeat the loop's drain logic — an un-drained level-triggered
+    /// eventfd keeps the token readable on every poll (busy-loop), and
+    /// with the conventional `Token.wakeup` collisions are easy to hit.
+    /// Multiplex wake reasons behind a single waker instead: set
+    /// flags/enqueue into a queue, `wake()`, let the loop check them
+    /// after wakeup — the canonical tokio pattern.
+    ///
+    /// Like mio, the flag never clears: creating a second waker after
+    /// the first one died still traps. Wakers are loop-lifetime objects.
+    private let _hasWaker = Atomic<Bool>(false)
+    #endif
+
     /// Creates the epoll fd (`epoll_create1` + `EPOLL_CLOEXEC`).
     /// Internal: obtain a `Registry` from `Poll.registry`, mirroring
     /// mio where `Registry` is only handed out by `Poll`.
@@ -240,6 +267,19 @@ public final class Registry: Sendable, Hashable {
         }
         self._epfd = fd
     }
+
+    #if DEBUG
+    /// Debug-only single-waker enforcement (mio parity). Called from
+    /// `Waker.init` after a successful registration.
+    internal func _registerWaker() {
+        assert(
+            !_hasWaker.exchange(true, ordering: .acquiringAndReleasing),
+            "Only a single Waker can be active per Registry (mio parity). " +
+            "Multiplex wake reasons behind one waker: flags/queue checked " +
+            "after wakeup, as tokio does."
+        )
+    }
+    #endif
 
     deinit {
         // The single owner: runs when the last reference (from `Poll`,

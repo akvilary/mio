@@ -497,6 +497,115 @@ struct PollTests {
         #expect(try ev.wait(on: p, timeout: .immediate) == 1)
         ev.forEach { #expect($0.token == Token(9)) }
     }
+
+    // MARK: - Timeout saturation
+
+    @Test("PollTimeout saturates instead of trapping on overflow")
+    func timeoutSaturation() throws {
+        // milliseconds: values beyond CInt.max collapse to CInt.max
+        // (~24.8 days); negatives collapse to 0 (immediate).
+        #expect(PollTimeout.milliseconds(10_000_000_000).rawMilliseconds == CInt.max)
+        #expect(PollTimeout.milliseconds(-5).rawMilliseconds == 0)
+
+        // nanoseconds: the ms FALLBACK saturates, while the nanosecond
+        // component carries the caller's full value (epoll_pwait2
+        // timespec.tv_sec is 64-bit).
+        let huge = PollTimeout.nanoseconds(1_000_000_000_000, 0) // ~31,700 years
+        #expect(huge.rawMilliseconds == CInt.max)
+        #expect(huge.rawNanoseconds.sec == 1_000_000_000_000)
+
+        // Normal path unchanged: ceiling to whole milliseconds.
+        #expect(PollTimeout.nanoseconds(1, 500_000_000).rawMilliseconds == 1500)
+        #expect(PollTimeout.nanoseconds(0, 1).rawMilliseconds == 1)
+        #expect(PollTimeout.nanoseconds(-7, 0).rawMilliseconds == -1)
+    }
+
+    // MARK: - sigmask / EINTR
+
+    @Test("waitNano with a sigmask takes timeouts and events normally")
+    func waitNanoSigmaskBasic() throws {
+        let p = try Poll()
+        let waker = try Waker(registry: p.registry, token: Token(11))
+
+        var mask = sigset_t()
+        sigemptyset(&mask)
+        sigaddset(&mask, SIGUSR1)
+
+        var ev = Events(capacity: 4)
+        // Timeout with the mask installed: returns 0, no error.
+        #expect(try ev.waitNano(
+            on: p, timeout: .nanoseconds(0, 50_000_000), sigmask: &mask) == 0)
+        // Event delivery is unaffected by the mask.
+        #expect(waker.wake())
+        #expect(try ev.waitNano(
+            on: p, timeout: .nanoseconds(0, 200_000_000), sigmask: &mask) == 1)
+        ev.forEach { #expect($0.token == Token(11)) }
+        _ = waker.reset()
+    }
+
+    @Test("waitNano sigmask is installed atomically: pending signal delivered, EINTR retried")
+    func waitNanoSigmaskEINTR() throws {
+        // Block SIGUSR1 on this thread, then raise() it — with the
+        // signal blocked it goes pending instead of being delivered.
+        var block = sigset_t()
+        sigemptyset(&block)
+        sigaddset(&block, SIGUSR1)
+        #expect(pthread_sigmask(Int32(SIG_BLOCK), &block, nil) == 0)
+        let oldHandler = signal(SIGUSR1, mioTestSigusr1Handler)
+        defer { signal(SIGUSR1, oldHandler) }
+        mioTestSigusr1Count = 0
+        raise(SIGUSR1)
+
+        // Nothing is registered with the poll, so the wait must BLOCK —
+        // epoll_pwait2 installs the empty (all-unblocked) mask at entry,
+        // the pending SIGUSR1 is delivered right there (handler runs,
+        // count → 1) and the syscall returns EINTR. The internal retry
+        // re-enters with the full timeout (documented caveat) and this
+        // time blocks to completion: n == 0 after ~300 ms.
+        //
+        // NB: pre-firing the waker would defeat the test — ready events
+        // take the fast path and the mask is never installed.
+        let p = try Poll()
+
+        var empty = sigset_t()
+        sigemptyset(&empty)
+        var ev = Events(capacity: 4)
+        let start = Date()
+        let n = try ev.waitNano(on: p, timeout: .nanoseconds(0, 300_000_000), sigmask: &empty)
+        let elapsed = Date().timeIntervalSince(start)
+        #expect(n == 0)
+        // The EINTR was instant; the retry re-blocked for the full timeout.
+        #expect(elapsed >= 0.28)
+        #expect(elapsed < 2)
+
+        // Exactly one delivery. On pre-5.11 kernels (ENOSYS fallback to
+        // epoll_wait) the mask is never installed and the signal stays
+        // pending — accept that too, but then drain it.
+        let pwait2Worked = !Poll.pwait2Unavailable.load(ordering: .acquiring)
+        #expect(mioTestSigusr1Count == (pwait2Worked ? 1 : 0))
+        if !pwait2Worked {
+            // Non-blocking drain of the still-pending signal so later
+            // tests are unaffected.
+            var set = block
+            var zero = timespec()
+            _ = sigtimedwait(&set, nil, &zero)
+        }
+
+        // Restore the thread's mask for other tests.
+        #expect(pthread_sigmask(Int32(SIG_UNBLOCK), &block, nil) == 0)
+    }
+}
+
+// MARK: - Signal-handler test support
+
+/// SIGUSR1 delivery counter. Written ONLY from the signal handler — a
+/// single aligned Int32 increment is adequate for test purposes on
+/// x86_64/arm64 (no torn access, no other writers).
+nonisolated(unsafe) var mioTestSigusr1Count: Int32 = 0
+
+/// Non-capturing handler, convertible to a C function pointer.
+private func mioTestSigusr1Handler(_ sig: Int32) {
+    mioTestSigusr1Count &+= 1
 }
 
 // MARK: - Test-only helpers

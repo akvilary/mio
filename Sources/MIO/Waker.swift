@@ -30,10 +30,18 @@ import Glibc
 /// sharing, which is exactly what ARC references provide (Rust callers
 /// wrap mio's `Waker` in an `Arc` for the same effect — see mio's own
 /// `waker.rs` example). All stored properties are immutable `let`s of
-/// `Sendable` types, so `Sendable` is satisfied structurally. Multiple
-/// wakers may share the same token (wakeup coalescing is the kernel's
-/// responsibility: eventfd's counter saturates at `UINT64_MAX - 1` and a
-/// write into a full counter fails with `EAGAIN`).
+/// `Sendable` types, so `Sendable` is satisfied structurally.
+///
+/// **One waker per registry** (mio parity, debug-enforced): creating a
+/// second `Waker` against the same `Registry` traps in debug builds.
+/// Distinct-token wakers would be technically safe on epoll, but a
+/// shared-token pair is a genuine footgun — the loop drains only its
+/// own eventfd, an un-drained level-triggered counter keeps the token
+/// readable on every poll, and the loop spins. Multiplex wake reasons
+/// (shutdown, timers, signals) behind a single waker instead: set
+/// flags/enqueue, `wake()`, let the loop check them after wakeup — the
+/// canonical tokio pattern. Like mio, the debug flag never resets, so
+/// wakers are expected to be loop-lifetime objects.
 ///
 /// **Lifetime:**
 ///   - The waker owns its eventfd and closes it in `deinit`. Callers
@@ -79,6 +87,12 @@ public final class Waker: Sendable {
             _ = Glibc.close(fd)
             throw error
         }
+        #if DEBUG
+        // Debug-only single-waker enforcement (mio parity); see the
+        // type-level docs. After a successful registration so a failed
+        // init does not poison the flag.
+        registry._registerWaker()
+        #endif
         self.fd = fd
         self.token = token
     }
