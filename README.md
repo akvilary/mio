@@ -12,6 +12,9 @@ the documentation) transfers directly. Deliberate divergences are listed
 > I/O. Higher layers build on top of it, exactly as Tokio builds on mio. Think
 > of it as the epoll primitives, not a Tokio replacement.
 
+> 📘 Полное описание архитектуры, владения, потоковой модели и схем всех
+> операций — в [ARCHITECTURE.md](ARCHITECTURE.md).
+
 ## Status
 
 Early / experimental. The API is small and the test suite covers the core
